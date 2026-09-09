@@ -184,6 +184,7 @@ class FrameObservation(Base):
     non_compliant_count: Mapped[int] = mapped_column(Integer, nullable=False)
     unknown_count: Mapped[int] = mapped_column(Integer, nullable=False)
     confidence_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

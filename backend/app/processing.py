@@ -202,6 +202,7 @@ def _persist_frame_observations(
     detections: DetectionOutcome,
 ) -> None:
     """Store one non-identifying count summary for each sampled frame exactly once."""
+    expires_at = datetime.now(UTC) + timedelta(hours=settings.frame_observation_retention_hours)
     existing_indexes = {
         index
         for index in session.scalars(
@@ -227,5 +228,6 @@ def _persist_frame_observations(
                         "maximum_failure_confidence": round(max(confidences), 3) if confidences else None,
                     }
                 ),
+                expires_at=expires_at,
             )
         )

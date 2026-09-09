@@ -23,6 +23,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260909_auth_lifecycle_and_audit", _upgrade_auth_lifecycle_and_audit),
         ("20260909_reporting_and_model_evaluations", _upgrade_reporting_and_model_evaluations),
         ("20260909_frame_observations", _upgrade_frame_observations),
+        ("20260909_frame_observation_expiry", _upgrade_frame_observation_expiry),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -93,10 +94,26 @@ def _upgrade_frame_observations(connection: Connection) -> None:
             "non_compliant_count INTEGER NOT NULL, "
             "unknown_count INTEGER NOT NULL, "
             "confidence_summary TEXT NOT NULL, "
+            "expires_at TIMESTAMP, "
             "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
         )
     )
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_frame_observations_job_id ON frame_observations (job_id)"))
+
+
+def _upgrade_frame_observation_expiry(connection: Connection) -> None:
+    """Add an explicit expiry timestamp to legacy frame summaries safely."""
+    _add_missing_columns(connection, "frame_observations", {"expires_at": "TIMESTAMP"})
+    connection.execute(
+        text(
+            "UPDATE frame_observations "
+            "SET expires_at = datetime(created_at, '+24 hours') "
+            "WHERE expires_at IS NULL"
+        )
+    )
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_frame_observations_expires_at ON frame_observations (expires_at)")
+    )
 
 
 def _add_missing_columns(connection: Connection, table: str, additions: dict[str, str]) -> None:

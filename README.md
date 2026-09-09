@@ -6,7 +6,7 @@ A safety-first, non-identifying proof of concept for manual CCTV still/video pro
 
 ## Current implementation
 
-- React and TypeScript dashboard for private JPEG, PNG, MP4, and MOV submission.
+- Role-aware React and TypeScript POC workflows for private JPEG, PNG, MP4, and MOV submission, alert review, aggregate reporting, configuration, model evaluation, and restricted audit review.
 - FastAPI API with OpenAPI routes at `/docs`.
 - Durable zones, policy versions, sources, media jobs, alerts, private evidence metadata, and aggregate metrics.
 - SQLite default for zero-cost local development; configurable PostgreSQL URL for shared environments.
@@ -18,7 +18,8 @@ A safety-first, non-identifying proof of concept for manual CCTV still/video pro
   - configured Hugging Face/Ultralytics PPE model for real POC inference.
 - Mandatory fail-closed OpenCV DNN ResNet SSD face detection and Gaussian blurring before evidence becomes available.
 - Role-gated evidence API that serves only current, face-blurred snapshots.
-- Scheduled retention task for raw media and evidence.
+- Scheduled, independently failure-tolerant, auditable retention task for raw media, face-blurred evidence, and frame summaries with explicit configuration-derived expiry timestamps.
+- JSON-safe Celery retention monitoring results with status, aggregate deletion counts, and high-level failure categories only.
 
 ## Required configuration for real processing
 
@@ -82,16 +83,20 @@ Open `http://localhost:5173`; API documentation is available at `http://localhos
 - The simple initial provider produces aggregate POC results and must be benchmarked before any pilot.
 - No worker names, persistent person identifiers, face embeddings, or raw evidence URLs are exposed.
 - Evidence expires automatically according to configured retention settings.
+- Frame-summary observations are short-lived and deleted only after their explicit configured expiry; they never contain persistent person IDs, worker identities, or biometric data.
+- Retention outcomes and deletion failures are recorded as restricted audit events; expired evidence remains inaccessible even when physical deletion must be retried.
+- This is not production-ready: managed storage, production identity controls, DPIA/legal validation, and deployment controls require validation before live CCTV use.
 
 ## Next increment
 
-1. Add model-result person/PPE association, multi-frame persistence, and cross-job policy-aware deduplication.
-2. Add database migrations, test coverage, audit events, durable model metadata, and controlled retry/cancellation.
-3. Add Apache ECharts trend and breakdown visualizations with aggregate reporting filters.
-4. Replace private local storage with managed object storage and configure PostgreSQL/Redis for shared deployment.
+1. Benchmark the configured PPE model against approved, representative POC datasets before any pilot.
+2. Validate policy thresholds, alert-review workflows, privacy controls, and retention operations through a governed POC evaluation.
+3. Replace private local storage with managed object storage and configure PostgreSQL/Redis for any shared deployment.
+4. Complete DPIA/legal review, production identity controls, monitoring, incident response, and deployment hardening before considering live CCTV use.
 
 ## Documentation
 
 - [Implementation plan](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-poc-implementation-plan.md)
 - [Project blueprint](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-project-blueprint.md)
 - [Technology decisions](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-technology-decisions.md)
+- [Operations guide](backend/OPERATIONS.md)

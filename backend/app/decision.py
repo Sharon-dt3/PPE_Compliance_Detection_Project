@@ -36,9 +36,9 @@ class SafetyDecisionService:
         consecutive sampled frames.
         """
         active_requirements = [
-            requirement
-            for requirement, negative_label, description in self._REQUIREMENTS
-            if getattr(policy, f"{requirement}_required")
+            requirement_definition
+            for requirement_definition in self._REQUIREMENTS
+            if getattr(policy, f"{requirement_definition[0]}_required")
         ]
         if not active_requirements:
             return DecisionOutcome(0, 0, 0, None, None, False)

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     max_frame_height: int = 2160
     evidence_retention_hours: int = 48
     raw_media_retention_hours: int = 1
+    frame_observation_retention_hours: int = 24
     database_url: str = "sqlite:///./data/ppe_compliance.db"
     redis_url: str = "redis://localhost:6379/0"
     private_media_directory: str = "./data/private-media"
