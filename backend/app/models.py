@@ -18,6 +18,7 @@ class JobStatus(str, Enum):
     """Lifecycle states for submitted media jobs."""
 
     QUEUED = "queued"
+    VALIDATING = "validating"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -32,6 +33,19 @@ class AlertStatus(str, Enum):
     ACKNOWLEDGED = "acknowledged"
     RESOLVED = "resolved"
     EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class ApplicationUser(Base):
+    """Minimal server-side role assignment for an authenticated identity-provider subject."""
+
+    __tablename__ = "application_users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    auth_subject: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Zone(Base):
@@ -88,6 +102,7 @@ class MediaJob(Base):
     storage_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(String(20), default=JobStatus.QUEUED.value, nullable=False, index=True)
     message: Mapped[str] = mapped_column(Text, default="Queued for private processing.", nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(80))
     compliant_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     non_compliant_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     unknown_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -119,6 +134,8 @@ class ComplianceAlert(Base):
     evidence_message: Mapped[str] = mapped_column(Text, nullable=False)
     acknowledgement_note: Mapped[str | None] = mapped_column(Text)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -149,11 +166,48 @@ class MetricRollup(Base):
     compliant: Mapped[int] = mapped_column(Integer, nullable=False)
     non_compliant: Mapped[int] = mapped_column(Integer, nullable=False)
     unknown: Mapped[int] = mapped_column(Integer, nullable=False)
+    shift: Mapped[str] = mapped_column(String(50), default="unspecified", nullable=False, index=True)
+    rule_key: Mapped[str] = mapped_column(String(120), default="all_required_ppe", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class FrameObservation(Base):
+    """A short-lived, non-identifying summary of one sampled processing frame."""
+
+    __tablename__ = "frame_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id: Mapped[str] = mapped_column(ForeignKey("media_jobs.id"), nullable=False, index=True)
+    frame_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    person_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    compliant_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    non_compliant_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    unknown_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ModelEvaluation(Base):
+    """Class-level benchmark metadata for a candidate PPE inference model."""
+
+    __tablename__ = "model_evaluations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_reference: Mapped[str] = mapped_column(String(255), nullable=False)
+    licence_status: Mapped[str] = mapped_column(String(120), nullable=False)
+    approval_state: Mapped[str] = mapped_column(String(50), default="poc_only", nullable=False)
+    class_metrics_json: Mapped[str] = mapped_column(Text, nullable=False)
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    effective_sampling_rate: Mapped[float | None] = mapped_column(Float)
+    limitations: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class AuditEvent(Base):
-    """An immutable operational event with no user identity, media, or biometric data."""
+    """An immutable operational event without raw media, biometric, or HR data."""
 
     __tablename__ = "audit_events"
 
@@ -161,6 +215,7 @@ class AuditEvent(Base):
     event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     entity_type: Mapped[str] = mapped_column(String(100), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    actor_reference: Mapped[str] = mapped_column(String(128), nullable=False)
     actor_role: Mapped[str] = mapped_column(String(50), nullable=False)
     detail: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

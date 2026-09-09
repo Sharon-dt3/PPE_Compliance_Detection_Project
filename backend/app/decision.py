@@ -94,6 +94,29 @@ class SafetyDecisionService:
             persistence_met=failed_requirement is not None,
         )
 
+    def summarize_frame(self, objects: tuple[DetectedObject, ...], policy: ZonePolicy) -> tuple[int, int, int, int, tuple[float, ...]]:
+        """Return a frame-scoped aggregate safety result without an identity or tracking key."""
+        requirements = [
+            requirement
+            for requirement in self._REQUIREMENTS
+            if getattr(policy, f"{requirement[0]}_required")
+        ]
+        people = [item for item in objects if item.label == "person" and self._accepted(item, policy)]
+        compliant = 0
+        non_compliant = 0
+        unknown = 0
+        confidences: list[float] = []
+        for person in people:
+            state, _, confidence = self._person_state(person, objects, requirements, policy)
+            if state is True:
+                compliant += 1
+            elif state is False:
+                non_compliant += 1
+                confidences.append(confidence)
+            else:
+                unknown += 1
+        return len(people), compliant, non_compliant, unknown, tuple(confidences)
+
     def _person_state(
         self,
         person: DetectedObject,

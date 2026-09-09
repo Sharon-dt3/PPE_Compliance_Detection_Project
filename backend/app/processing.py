@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit import record_audit_event
 from app.config import settings
 from app.database import SessionLocal
 from app.decision import DecisionOutcome, SafetyDecisionService
 from app.detection import DetectionOutcome, get_detection_provider
 from app.evidence import EvidenceService, PrivacyProcessingError
-from app.models import AuditEvent, ComplianceAlert, EvidenceSnapshot, JobStatus, MediaJob, MetricRollup, ZonePolicy
+from app.models import ComplianceAlert, EvidenceSnapshot, FrameObservation, JobStatus, MediaJob, MetricRollup, ZonePolicy
 
 
 def process_media_job(job_id: str) -> None:
@@ -40,7 +42,15 @@ def process_media_job(job_id: str) -> None:
             job.status = JobStatus.FAILED.value
             job.message = "Processing failed safely. Review approved model configuration and retry after correction."
             job.completed_at = datetime.now(UTC)
-            _audit(session, "media_job.processing_failed", "media_job", job.id, "worker", "Safe processing failure.")
+            record_audit_event(
+                session,
+                "media_job.processing_failed",
+                "media_job",
+                job.id,
+                "processing-worker",
+                "system",
+                "Safe processing failure.",
+            )
             session.commit()
 
 
@@ -67,6 +77,7 @@ def _persist_outcome(
         else "Processing complete. No persistent non-compliance evidence was confirmed."
     )
 
+    _persist_frame_observations(session, job, policy, detections)
     if not session.scalar(select(MetricRollup).where(MetricRollup.job_id == job.id)):
         session.add(
             MetricRollup(
@@ -79,7 +90,15 @@ def _persist_outcome(
                 unknown=decision.unknown_count,
             )
         )
-    _audit(session, "media_job.completed", "media_job", job.id, "worker", "Non-identifying aggregate outcome persisted.")
+    record_audit_event(
+        session,
+        "media_job.completed",
+        "media_job",
+        job.id,
+        "processing-worker",
+        "system",
+        "Non-identifying aggregate outcome persisted.",
+    )
 
     if not decision.persistence_met or not decision.failed_requirement:
         return
@@ -99,7 +118,15 @@ def _persist_outcome(
         alert.last_observed_at = now
         alert.occurrence_count += 1
         alert.confidence = max(alert.confidence, decision.confidence or 0)
-        _audit(session, "alert.deduplicated", "compliance_alert", alert.id, "worker", "Repeated policy evidence merged.")
+        record_audit_event(
+            session,
+            "alert.deduplicated",
+            "compliance_alert",
+            alert.id,
+            "processing-worker",
+            "system",
+            "Repeated policy evidence merged.",
+        )
         return
 
     alert = ComplianceAlert(
@@ -117,13 +144,34 @@ def _persist_outcome(
     )
     session.add(alert)
     session.flush()
-    _audit(session, "alert.created", "compliance_alert", alert.id, "worker", "Persistent non-identifying safety evidence confirmed.")
+    record_audit_event(
+        session,
+        "alert.created",
+        "compliance_alert",
+        alert.id,
+        "processing-worker",
+        "system",
+        "Persistent non-identifying safety evidence confirmed.",
+    )
 
     try:
-        storage_key = EvidenceService().create_blurred_evidence(media_path)
+        evidence_objects = detections.frames[-1].objects if detections.frames else ()
+        storage_key = EvidenceService().create_annotated_blurred_evidence(
+            media_path,
+            evidence_objects,
+            decision.failed_requirement,
+        )
     except PrivacyProcessingError:
         alert.evidence_message = "Evidence is unavailable because mandatory privacy processing did not complete."
-        _audit(session, "evidence.blocked", "compliance_alert", alert.id, "worker", "Mandatory face-blur gate did not complete.")
+        record_audit_event(
+            session,
+            "evidence.blocked",
+            "compliance_alert",
+            alert.id,
+            "processing-worker",
+            "system",
+            "Mandatory face-blur gate did not complete.",
+        )
         return
 
     session.add(
@@ -136,17 +184,48 @@ def _persist_outcome(
     )
     alert.evidence_available = True
     alert.evidence_message = "Face-blurred evidence is available to authorized reviewers for the configured retention period."
-    _audit(session, "evidence.created", "compliance_alert", alert.id, "worker", "Face-blurred evidence created.")
-
-
-def _audit(session: Session, event_type: str, entity_type: str, entity_id: str, actor_role: str, detail: str) -> None:
-    """Append a non-identifying audit event in the active transaction."""
-    session.add(
-        AuditEvent(
-            event_type=event_type,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            actor_role=actor_role,
-            detail=detail,
-        )
+    record_audit_event(
+        session,
+        "evidence.created",
+        "compliance_alert",
+        alert.id,
+        "processing-worker",
+        "system",
+        "Face-blurred evidence created.",
     )
+
+
+def _persist_frame_observations(
+    session: Session,
+    job: MediaJob,
+    policy: ZonePolicy,
+    detections: DetectionOutcome,
+) -> None:
+    """Store one non-identifying count summary for each sampled frame exactly once."""
+    existing_indexes = {
+        index
+        for index in session.scalars(
+            select(FrameObservation.frame_index).where(FrameObservation.job_id == job.id)
+        ).all()
+    }
+    decision_service = SafetyDecisionService()
+    for frame in detections.frames:
+        if frame.frame_index in existing_indexes:
+            continue
+        people, compliant, non_compliant, unknown, confidences = decision_service.summarize_frame(frame.objects, policy)
+        session.add(
+            FrameObservation(
+                job_id=job.id,
+                frame_index=frame.frame_index,
+                person_count=people,
+                compliant_count=compliant,
+                non_compliant_count=non_compliant,
+                unknown_count=unknown,
+                confidence_summary=json.dumps(
+                    {
+                        "minimum_failure_confidence": round(min(confidences), 3) if confidences else None,
+                        "maximum_failure_confidence": round(max(confidences), 3) if confidences else None,
+                    }
+                ),
+            )
+        )

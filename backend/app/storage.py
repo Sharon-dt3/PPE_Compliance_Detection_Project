@@ -23,6 +23,10 @@ class PrivateMediaStorage:
         (self._root / storage_key).write_bytes(content)
         return storage_key
 
+    def root_path(self, storage_key: str) -> Path:
+        """Resolve an opaque key for trusted backend-only validation and processing."""
+        return self._root / storage_key
+
     def delete(self, storage_key: str) -> None:
         """Delete an opaque storage key without raising when it was already removed."""
         (self._root / storage_key).unlink(missing_ok=True)

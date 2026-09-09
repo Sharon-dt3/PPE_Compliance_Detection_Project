@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from app.config import settings
+from app.detection import DetectedObject
 
 
 class PrivacyProcessingError(RuntimeError):
@@ -23,8 +24,13 @@ class EvidenceService:
         self._root = Path(settings.private_evidence_directory)
         self._root.mkdir(parents=True, exist_ok=True)
 
-    def create_blurred_evidence(self, media_path: str) -> str:
-        """Blur all faces from the first readable video/image frame and store the processed JPEG.
+    def create_annotated_blurred_evidence(
+        self,
+        media_path: str,
+        objects: tuple[DetectedObject, ...],
+        policy_result: str,
+    ) -> str:
+        """Annotate relevant safety detections, blur all faces, and store a protected JPEG.
 
         Raises:
             PrivacyProcessingError: If the source cannot be read, detector assets are unavailable,
@@ -32,7 +38,8 @@ class EvidenceService:
         """
         frame = self._read_first_frame(media_path)
         detector = self._load_face_detector()
-        blurred = self._blur_detected_faces(frame, detector)
+        annotated = self._annotate_safety_result(frame, objects, policy_result)
+        blurred = self._blur_detected_faces(annotated, detector)
         storage_key = f"{uuid4()}.jpg"
 
         if not cv2.imwrite(str(self._root / storage_key), blurred):
@@ -65,6 +72,80 @@ class EvidenceService:
         if not success or frame is None:
             raise PrivacyProcessingError("No readable evidence frame was available from the submitted media.")
         return frame
+
+    @staticmethod
+    def _annotate_safety_result(
+        image: np.ndarray,
+        objects: tuple[DetectedObject, ...],
+        policy_result: str,
+    ) -> np.ndarray:
+        """Draw only relevant PPE and person boxes before mandatory anonymisation.
+
+        Detection objects are frame-local and are never written to the database. The
+        resulting image is immediately passed to the fail-closed face-blur stage.
+        """
+        output = image.copy()
+        height, width = output.shape[:2]
+        colours = {
+            "person": (255, 153, 0),
+            "helmet": (40, 170, 70),
+            "no_helmet": (40, 40, 220),
+            "vest": (40, 170, 70),
+            "no_vest": (40, 40, 220),
+        }
+        for item in objects:
+            if item.label not in colours:
+                continue
+            x1, y1, x2, y2 = EvidenceService._pixel_box(item, width, height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            colour = colours[item.label]
+            cv2.rectangle(output, (x1, y1), (x2, y2), colour, 2)
+            cv2.putText(
+                output,
+                f"{item.label.replace('_', ' ')} {item.confidence:.0%}",
+                (x1, max(16, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                colour,
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.putText(
+            output,
+            f"Safety observation: {policy_result}",
+            (12, max(24, height - 14)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            f"Safety observation: {policy_result}",
+            (12, max(24, height - 14)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (30, 30, 30),
+            1,
+            cv2.LINE_AA,
+        )
+        return output
+
+    @staticmethod
+    def _pixel_box(item: DetectedObject, width: int, height: int) -> tuple[int, int, int, int]:
+        """Convert either normalized or pixel inference coordinates into image bounds."""
+        box = item.box
+        normalized = 0 <= box.left <= 1 and 0 <= box.top <= 1 and 0 <= box.right <= 1 and 0 <= box.bottom <= 1
+        scale_x = width if normalized else 1
+        scale_y = height if normalized else 1
+        return (
+            max(0, min(width, int(box.left * scale_x))),
+            max(0, min(height, int(box.top * scale_y))),
+            max(0, min(width, int(box.right * scale_x))),
+            max(0, min(height, int(box.bottom * scale_y))),
+        )
 
     @staticmethod
     def _load_face_detector() -> cv2.dnn_Net:
