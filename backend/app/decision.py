@@ -9,6 +9,15 @@ from app.models import ZonePolicy
 
 
 @dataclass(frozen=True)
+class PersonState:
+    """One frame-scoped person's compliance state; carries no cross-frame identity."""
+
+    compliant: bool | None
+    failed_requirement: str | None
+    confidence: float
+
+
+@dataclass(frozen=True)
 class DecisionOutcome:
     """Non-identifying, policy-evaluated decision result for one media job."""
 
@@ -94,28 +103,34 @@ class SafetyDecisionService:
             persistence_met=failed_requirement is not None,
         )
 
-    def summarize_frame(self, objects: tuple[DetectedObject, ...], policy: ZonePolicy) -> tuple[int, int, int, int, tuple[float, ...]]:
-        """Return a frame-scoped aggregate safety result without an identity or tracking key."""
+    def person_states_for_frame(
+        self, objects: tuple[DetectedObject, ...], policy: ZonePolicy
+    ) -> tuple[PersonState, ...]:
+        """Return one frame-scoped compliance state per detected person, in detector order.
+
+        The returned sequence carries no identity: its order reflects only the detector's
+        per-frame output and must never be used to correlate a person across frames or jobs.
+        """
         requirements = [
             requirement
             for requirement in self._REQUIREMENTS
             if getattr(policy, f"{requirement[0]}_required")
         ]
         people = [item for item in objects if item.label == "person" and self._accepted(item, policy)]
-        compliant = 0
-        non_compliant = 0
-        unknown = 0
-        confidences: list[float] = []
+        states = []
         for person in people:
-            state, _, confidence = self._person_state(person, objects, requirements, policy)
-            if state is True:
-                compliant += 1
-            elif state is False:
-                non_compliant += 1
-                confidences.append(confidence)
-            else:
-                unknown += 1
-        return len(people), compliant, non_compliant, unknown, tuple(confidences)
+            compliant, requirement, confidence = self._person_state(person, objects, requirements, policy)
+            states.append(PersonState(compliant, requirement, confidence))
+        return tuple(states)
+
+    def summarize_frame(self, objects: tuple[DetectedObject, ...], policy: ZonePolicy) -> tuple[int, int, int, int, tuple[float, ...]]:
+        """Return a frame-scoped aggregate safety result without an identity or tracking key."""
+        states = self.person_states_for_frame(objects, policy)
+        compliant = sum(1 for state in states if state.compliant is True)
+        non_compliant = sum(1 for state in states if state.compliant is False)
+        unknown = sum(1 for state in states if state.compliant is None)
+        confidences = tuple(state.confidence for state in states if state.compliant is False)
+        return len(states), compliant, non_compliant, unknown, confidences
 
     def _person_state(
         self,

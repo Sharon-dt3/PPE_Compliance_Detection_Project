@@ -24,6 +24,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260909_reporting_and_model_evaluations", _upgrade_reporting_and_model_evaluations),
         ("20260909_frame_observations", _upgrade_frame_observations),
         ("20260909_frame_observation_expiry", _upgrade_frame_observation_expiry),
+        ("20260909_person_observations", _upgrade_person_observations),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -113,6 +114,28 @@ def _upgrade_frame_observation_expiry(connection: Connection) -> None:
     )
     connection.execute(
         text("CREATE INDEX IF NOT EXISTS ix_frame_observations_expires_at ON frame_observations (expires_at)")
+    )
+
+
+def _upgrade_person_observations(connection: Connection) -> None:
+    """Create short-lived, non-identifying per-person frame observations when absent."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS person_observations ("
+            "id VARCHAR(36) PRIMARY KEY, "
+            "job_id VARCHAR(36) NOT NULL, "
+            "frame_index INTEGER NOT NULL, "
+            "person_index INTEGER NOT NULL, "
+            "state VARCHAR(20) NOT NULL, "
+            "failed_requirement VARCHAR(120), "
+            "confidence FLOAT, "
+            "expires_at TIMESTAMP NOT NULL, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+        )
+    )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_person_observations_job_id ON person_observations (job_id)"))
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_person_observations_expires_at ON person_observations (expires_at)")
     )
 
 

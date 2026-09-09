@@ -40,6 +40,8 @@ class _Session:
         *,
         frame_rows: int = 0,
         frame_delete_fails: bool = False,
+        person_rows: int = 0,
+        person_delete_fails: bool = False,
     ) -> None:
         self._scalar_results = [_ScalarResult(jobs), _ScalarResult(evidence)]
         self.added: list[object] = []
@@ -47,13 +49,20 @@ class _Session:
         self.rolled_back = False
         self.frame_rows = frame_rows
         self.frame_delete_fails = frame_delete_fails
+        self.person_rows = person_rows
+        self.person_delete_fails = person_delete_fails
 
     def scalars(self, _: object) -> _ScalarResult:
         """Return prepared category results in retention query order."""
         return self._scalar_results.pop(0)
 
-    def execute(self, _: object) -> _DeleteResult:
-        """Return deletion count or simulate an isolated database failure."""
+    def execute(self, statement: object) -> _DeleteResult:
+        """Return a table-specific deletion count or simulate an isolated database failure."""
+        table_name = statement.table.name
+        if table_name == "person_observations":
+            if self.person_delete_fails:
+                raise SQLAlchemyError("person-summary cleanup unavailable")
+            return _DeleteResult(self.person_rows)
         if self.frame_delete_fails:
             raise SQLAlchemyError("frame cleanup unavailable")
         return _DeleteResult(self.frame_rows)
@@ -95,7 +104,7 @@ def test_retention_deletes_expired_media_evidence_and_frame_summaries() -> None:
     now = datetime(2026, 9, 9, tzinfo=UTC)
     job = SimpleNamespace(id="job-1", storage_key="opaque-upload.jpg")
     snapshot = SimpleNamespace(id="evidence-1", storage_key="opaque-evidence.jpg", deleted_at=None)
-    session = _Session([job], [snapshot], frame_rows=4)
+    session = _Session([job], [snapshot], frame_rows=4, person_rows=9)
     media_storage = _Storage()
     evidence_storage = _Storage()
 
@@ -110,6 +119,7 @@ def test_retention_deletes_expired_media_evidence_and_frame_summaries() -> None:
     assert result.expired_media_deleted == 1
     assert result.expired_evidence_deleted == 1
     assert result.expired_frame_summaries_deleted == 4
+    assert result.expired_person_summaries_deleted == 9
     assert result.failures == 0
     assert media_storage.deleted == ["opaque-upload.jpg"]
     assert evidence_storage.deleted == ["opaque-evidence.jpg"]
@@ -120,6 +130,7 @@ def test_retention_deletes_expired_media_evidence_and_frame_summaries() -> None:
         "retention.media_deleted",
         "retention.evidence_deleted",
         "retention.frame_summaries_deleted",
+        "retention.person_summaries_deleted",
         "retention.executed",
     }
 
@@ -194,12 +205,40 @@ def test_evidence_and_frame_failures_are_audited_without_stopping_media_cleanup(
     assert any(event.event_type == "retention.completed_with_errors" for event in _events(session))
 
 
+def test_person_summary_failure_is_audited_without_stopping_other_cleanup() -> None:
+    """A failed person-observation cleanup is isolated, audited, and does not block other categories."""
+    now = datetime(2026, 9, 9, tzinfo=UTC)
+    job = SimpleNamespace(id="job-6", storage_key="opaque-upload.jpg")
+    snapshot = SimpleNamespace(id="evidence-6", storage_key="opaque-evidence.jpg", deleted_at=None)
+    session = _Session([job], [snapshot], frame_rows=3, person_delete_fails=True)
+    media_storage = _Storage()
+    evidence_storage = _Storage()
+
+    result = remove_expired_private_data_for_session(
+        session,
+        now=now,
+        media_storage=media_storage,
+        evidence_storage=evidence_storage,
+    )
+
+    assert result.status == "completed_with_errors"
+    assert result.failure_categories == ("person_summary_deletion",)
+    assert result.expired_media_deleted == 1
+    assert result.expired_evidence_deleted == 1
+    assert result.expired_frame_summaries_deleted == 3
+    assert result.expired_person_summaries_deleted == 0
+    assert any(
+        event.event_type == "retention.failed" and event.entity_type == "person_observation"
+        for event in _events(session)
+    )
+
+
 def test_completely_failed_run_is_audited_with_explicit_failed_status() -> None:
     """All failed cleanup categories yield a safe failed aggregate audit outcome."""
     now = datetime(2026, 9, 9, tzinfo=UTC)
     job = SimpleNamespace(id="job-5", storage_key="opaque-upload.mov")
     snapshot = SimpleNamespace(id="evidence-5", storage_key="opaque-evidence.jpg", deleted_at=None)
-    session = _Session([job], [snapshot], frame_delete_fails=True)
+    session = _Session([job], [snapshot], frame_delete_fails=True, person_delete_fails=True)
 
     result = remove_expired_private_data_for_session(
         session,
@@ -213,10 +252,12 @@ def test_completely_failed_run_is_audited_with_explicit_failed_status() -> None:
         "media_deletion",
         "evidence_deletion",
         "frame_summary_deletion",
+        "person_summary_deletion",
     }
     assert result.expired_media_deleted == 0
     assert result.expired_evidence_deleted == 0
     assert result.expired_frame_summaries_deleted == 0
+    assert result.expired_person_summaries_deleted == 0
     assert any(event.event_type == "retention.failed" and event.entity_type == "retention_run" for event in _events(session))
 
 

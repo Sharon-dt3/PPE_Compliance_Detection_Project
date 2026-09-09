@@ -11,10 +11,11 @@ Celery Beat dispatches `ppe.remove_expired_private_data` hourly (`3600` seconds)
 | Raw approved upload | `MediaJob.expires_at`, set when the upload is accepted from `PPE_RAW_MEDIA_RETENTION_HOURS` | Deletes the private object and replaces the stored database reference with an opaque expired marker. |
 | Face-blurred evidence | `EvidenceSnapshot.expires_at`, set from the active zone-policy `evidence_retention_hours` value (24–72 hours) | Deletes the private evidence object and marks the snapshot deleted. The API blocks expired evidence even if physical deletion needs a retry. |
 | Frame observation summaries | `FrameObservation.expires_at`, set when processing persists a summary from `PPE_FRAME_OBSERVATION_RETENTION_HOURS` | Deletes only expired aggregate frame summaries; non-expired summaries are untouched. |
+| Person observation summaries | `PersonObservation.expires_at`, set alongside its parent frame summary from `PPE_FRAME_OBSERVATION_RETENTION_HOURS` | Deletes only expired per-person frame states; non-expired summaries are untouched. |
 | Aggregate metric rollups | Governance-controlled | Not deleted by this task. |
 | Audit records | Governance/security-controlled | Not deleted by this task. |
 
-Frame summaries contain only job-scoped counts, frame index, and confidence ranges. They contain no worker names, biometric information, face data, persistent person IDs, or profiles.
+Frame summaries contain only job-scoped counts, frame index, and confidence ranges. Person summaries contain only a frame-scoped state (`compliant`/`non_compliant`/`unknown`), the failed requirement, and a confidence value; `person_index` is only that frame's detection ordinal, never a tracking key. Neither table contains worker names, biometric information, face data, persistent person IDs, or profiles.
 
 ## Configuration
 
@@ -49,6 +50,7 @@ The task returns a JSON-serializable aggregate payload suitable for a monitoring
   "expired_media_deleted": 0,
   "expired_evidence_deleted": 0,
   "expired_frame_summaries_deleted": 0,
+  "expired_person_summaries_deleted": 0,
   "failures": 0,
   "failure_categories": []
 }
@@ -68,7 +70,8 @@ Successful outcomes add append-only audit events including:
 
 - `retention.media_deleted`;
 - `retention.evidence_deleted`;
-- `retention.frame_summaries_deleted`; and
+- `retention.frame_summaries_deleted`;
+- `retention.person_summaries_deleted`; and
 - `retention.executed`.
 
 Failed category or object cleanup adds `retention.failed`. A partial run is recorded as `retention.completed_with_errors`; when all cleanup work fails, the aggregate run is recorded as `retention.failed` with a `failed` task status. Audit details include safe aggregate counts or high-level failure categories only—not raw paths, storage keys, public URLs, media contents, biometrics, worker identities, or HR data.
@@ -77,7 +80,7 @@ Authorized administrators and privacy/governance reviewers may inspect restricte
 
 ## Failure recovery
 
-1. Identify the high-level failed category from the task result (`media_deletion`, `evidence_deletion`, or `frame_summary_deletion`).
+1. Identify the high-level failed category from the task result (`media_deletion`, `evidence_deletion`, `frame_summary_deletion`, or `person_summary_deletion`).
 2. Inspect the aggregate task result and corresponding restricted audit records.
 3. Confirm the relevant private storage or database service is available without downloading, viewing, copying, or exposing unnecessary raw media or evidence.
 4. Allow the next scheduled execution to retry. Failed raw-media and evidence records retain their original opaque key so they remain eligible; expired evidence remains unavailable through the API.

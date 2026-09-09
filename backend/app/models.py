@@ -188,6 +188,27 @@ class FrameObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class PersonObservation(Base):
+    """A short-lived, non-identifying per-person compliance state for one sampled frame.
+
+    ``person_index`` is only the ordinal position of a detected person within a single
+    frame's detector output. It is never a tracking key: it carries no meaning across
+    frames, jobs, or time, and must never be joined against another job's records.
+    """
+
+    __tablename__ = "person_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id: Mapped[str] = mapped_column(ForeignKey("media_jobs.id"), nullable=False, index=True)
+    frame_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    person_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    failed_requirement: Mapped[str | None] = mapped_column(String(120))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class ModelEvaluation(Base):
     """Class-level benchmark metadata for a candidate PPE inference model."""
 

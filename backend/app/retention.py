@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.audit import record_audit_event
 from app.database import SessionLocal
-from app.models import EvidenceSnapshot, FrameObservation, MediaJob
+from app.models import EvidenceSnapshot, FrameObservation, MediaJob, PersonObservation
 from app.storage import PrivateMediaStorage
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ class RetentionResult:
     expired_media_deleted: int = 0
     expired_evidence_deleted: int = 0
     expired_frame_summaries_deleted: int = 0
+    expired_person_summaries_deleted: int = 0
     failures: int = 0
     failure_categories: tuple[str, ...] = ()
 
@@ -52,9 +53,9 @@ class RetentionResult:
 def remove_expired_private_data() -> RetentionResult:
     """Run scheduled privacy retention and return an aggregate monitoring result.
 
-    Raw private media, face-blurred evidence, and frame-level aggregate summaries are
-    processed independently. Aggregate metric rollups and audit records are intentionally
-    not removed by this task.
+    Raw private media, face-blurred evidence, and frame-level and person-level aggregate
+    summaries are processed independently. Aggregate metric rollups and audit records are
+    intentionally not removed by this task.
     """
     from app.evidence import EvidenceService
 
@@ -95,12 +96,13 @@ def remove_expired_private_data_for_session(
     media_deleted = _remove_expired_media(session, private_media, execution_time, failure_categories)
     evidence_deleted = _remove_expired_evidence(session, private_evidence, execution_time, failure_categories)
     frame_deleted = _remove_expired_frame_summaries(session, execution_time, failure_categories)
+    person_deleted = _remove_expired_person_summaries(session, execution_time, failure_categories)
 
     failures = len(failure_categories)
     status: RetentionStatus
     if failures == 0:
         status = "completed"
-    elif media_deleted or evidence_deleted or frame_deleted:
+    elif media_deleted or evidence_deleted or frame_deleted or person_deleted:
         status = "completed_with_errors"
     else:
         status = "failed"
@@ -110,6 +112,7 @@ def remove_expired_private_data_for_session(
         expired_media_deleted=media_deleted,
         expired_evidence_deleted=evidence_deleted,
         expired_frame_summaries_deleted=frame_deleted,
+        expired_person_summaries_deleted=person_deleted,
         failures=failures,
         failure_categories=tuple(failure_categories),
     )
@@ -232,6 +235,37 @@ def _remove_expired_frame_summaries(
         return 0
 
 
+def _remove_expired_person_summaries(
+    session: Session,
+    execution_time: datetime,
+    failure_categories: list[str],
+) -> int:
+    """Delete only per-person frame observations whose explicit expiry has elapsed."""
+    try:
+        result = session.execute(delete(PersonObservation).where(PersonObservation.expires_at <= execution_time))
+        deleted_count = max(result.rowcount or 0, 0)
+        if deleted_count:
+            _record_item_outcome(
+                session,
+                "retention.person_summaries_deleted",
+                "person_observation",
+                "expired-person-summaries",
+                f"{deleted_count} expired non-identifying person summary record(s) deleted.",
+            )
+        return deleted_count
+    except SQLAlchemyError:
+        logger.exception("Expired person-summary deletion failed.")
+        failure_categories.append("person_summary_deletion")
+        _record_item_outcome(
+            session,
+            "retention.failed",
+            "person_observation",
+            "expired-person-summaries",
+            "Expired person-summary deletion failed; records remain eligible for a later retention run.",
+        )
+        return 0
+
+
 def _record_item_outcome(session: Session, event_type: str, entity_type: str, entity_id: str, detail: str) -> None:
     """Append one safe item-level audit event without allowing audit errors to halt cleanup."""
     try:
@@ -259,6 +293,7 @@ def _record_run_outcome(session: Session, execution_time: datetime, result: Rete
             f"Retention status={result.status}; raw_media_deleted={result.expired_media_deleted}; "
             f"evidence_deleted={result.expired_evidence_deleted}; "
             f"frame_summaries_deleted={result.expired_frame_summaries_deleted}; "
+            f"person_summaries_deleted={result.expired_person_summaries_deleted}; "
             f"failures={result.failures}; categories={','.join(result.failure_categories) or 'none'}."
         ),
     )

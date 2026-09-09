@@ -15,7 +15,16 @@ from app.database import SessionLocal
 from app.decision import DecisionOutcome, SafetyDecisionService
 from app.detection import DetectionOutcome, get_detection_provider
 from app.evidence import EvidenceService, PrivacyProcessingError
-from app.models import ComplianceAlert, EvidenceSnapshot, FrameObservation, JobStatus, MediaJob, MetricRollup, ZonePolicy
+from app.models import (
+    ComplianceAlert,
+    EvidenceSnapshot,
+    FrameObservation,
+    JobStatus,
+    MediaJob,
+    MetricRollup,
+    PersonObservation,
+    ZonePolicy,
+)
 
 
 def process_media_job(job_id: str) -> None:
@@ -201,7 +210,11 @@ def _persist_frame_observations(
     policy: ZonePolicy,
     detections: DetectionOutcome,
 ) -> None:
-    """Store one non-identifying count summary for each sampled frame exactly once."""
+    """Store one non-identifying frame summary and per-person state for each sampled frame, once.
+
+    Person rows are ephemeral and frame-scoped: ``person_index`` is only the detector's
+    per-frame ordinal position, never a tracking key carried across frames or jobs.
+    """
     expires_at = datetime.now(UTC) + timedelta(hours=settings.frame_observation_retention_hours)
     existing_indexes = {
         index
@@ -213,12 +226,16 @@ def _persist_frame_observations(
     for frame in detections.frames:
         if frame.frame_index in existing_indexes:
             continue
-        people, compliant, non_compliant, unknown, confidences = decision_service.summarize_frame(frame.objects, policy)
+        person_states = decision_service.person_states_for_frame(frame.objects, policy)
+        compliant = sum(1 for state in person_states if state.compliant is True)
+        non_compliant = sum(1 for state in person_states if state.compliant is False)
+        unknown = sum(1 for state in person_states if state.compliant is None)
+        confidences = tuple(state.confidence for state in person_states if state.compliant is False)
         session.add(
             FrameObservation(
                 job_id=job.id,
                 frame_index=frame.frame_index,
-                person_count=people,
+                person_count=len(person_states),
                 compliant_count=compliant,
                 non_compliant_count=non_compliant,
                 unknown_count=unknown,
@@ -231,3 +248,24 @@ def _persist_frame_observations(
                 expires_at=expires_at,
             )
         )
+        for person_index, state in enumerate(person_states):
+            session.add(
+                PersonObservation(
+                    job_id=job.id,
+                    frame_index=frame.frame_index,
+                    person_index=person_index,
+                    state=_person_state_label(state.compliant),
+                    failed_requirement=state.failed_requirement,
+                    confidence=state.confidence if state.compliant is False else None,
+                    expires_at=expires_at,
+                )
+            )
+
+
+def _person_state_label(compliant: bool | None) -> str:
+    """Map a tri-state compliance result to its stored, non-identifying state label."""
+    if compliant is True:
+        return "compliant"
+    if compliant is False:
+        return "non_compliant"
+    return "unknown"
