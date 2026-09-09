@@ -1,11 +1,20 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, JSX, useEffect, useMemo, useRef, useState } from "react";
 import * as echarts from "echarts";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const SAFETY_NOTICE =
   "This POC provides indicative safety-support signals. It is not an employee productivity-monitoring system and must not be used for autonomous disciplinary or employment decisions.";
+
+// "supabase" requires VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY; any other/missing
+// configuration falls back to the local demonstration role selector.
+const AUTH_MODE = import.meta.env.VITE_AUTH_MODE === "supabase" ? "supabase" : "demo";
+const supabaseClient: SupabaseClient | null =
+  AUTH_MODE === "supabase" && import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY
+    ? createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_ANON_KEY)
+    : null;
 
 type Role =
   | "safety_supervisor"
@@ -113,6 +122,8 @@ type ModelEvaluation = {
   created_at: string;
 };
 
+type Me = { reference: string; role: Role };
+
 type AuditEvent = {
   id: string;
   event_type: string;
@@ -204,11 +215,32 @@ const initialRole = (): Role | null => {
   return savedRole && savedRole in ROLE_LABELS ? (savedRole as Role) : null;
 };
 
+/**
+ * Resolve the header proving the caller's identity for one request.
+ *
+ * Demo mode sends the labeled-non-production `X-Demo-Role` header. Supabase mode never
+ * sends a client-asserted role at all: it forwards the signed session access token, and the
+ * server independently resolves the caller's role from its own role-assignment table.
+ */
+const resolveAuthHeader = async (role: Role): Promise<Record<string, string>> => {
+  if (AUTH_MODE === "supabase" && supabaseClient) {
+    const { data } = await supabaseClient.auth.getSession();
+    return data.session ? { Authorization: `Bearer ${data.session.access_token}` } : {};
+  }
+  return { "X-Demo-Role": role };
+};
+
+const fetchMe = async (accessToken: string): Promise<Me> => {
+  const response = await fetch(`${API_URL}/api/v1/me`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!response.ok) throw new Error("Unable to resolve your assigned safety-platform role.");
+  return response.json() as Promise<Me>;
+};
+
 const request = async <T,>(role: Role, path: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(`${API_URL}${path}`, {
     ...options,
     headers: {
-      "X-Demo-Role": role,
+      ...(await resolveAuthHeader(role)),
       ...(options?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
       ...(options?.headers ?? {}),
     },
@@ -235,7 +267,7 @@ function ComplianceChart({ report }: { report: Report | null }) {
     chart.setOption({
       aria: { enabled: true, description: "Aggregate PPE observation breakdown." },
       color: ["#087f5b", "#c92a2a", "#d97706"],
-      tooltip: { trigger: "item", valueFormatter: (value) => `${value} observations` },
+      tooltip: { trigger: "item", valueFormatter: (value: number | string) => `${value} observations` },
       series: [{
         type: "pie",
         radius: ["48%", "76%"],
@@ -328,6 +360,52 @@ function Login({ onLogin }: { onLogin: (role: Role) => void }) {
 }
 
 // PUBLIC_INTERFACE
+function SupabaseLogin({ onAuthenticated }: { onAuthenticated: (me: Me) => void }) {
+  /** Render real OIDC sign-in; the server independently resolves the caller's role afterwards. */
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!supabaseClient) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const { data, error: signInError } = await supabaseClient.auth.signInWithPassword({ email, password });
+      if (signInError || !data.session) throw new Error(signInError?.message ?? "Sign-in failed.");
+      onAuthenticated(await fetchMe(data.session.access_token));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to sign in.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <main className="login-layout">
+      <section className="login-card" aria-labelledby="login-title">
+        <p className="eyebrow">Safety decision-support POC</p>
+        <h1 id="login-title">PPE Compliance Detection</h1>
+        <p className="subtitle">Sign in with your verified safety-platform identity. Your role is assigned and enforced server-side.</p>
+        <form onSubmit={(event) => void submit(event)}>
+          <label htmlFor="email">Work email
+            <input id="email" type="email" required autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} />
+          </label>
+          <label htmlFor="password">Password
+            <input id="password" type="password" required autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          </label>
+          {error && <p className="notice compact" role="alert">{error}</p>}
+          <button disabled={submitting} type="submit">{submitting ? "Signing in…" : "Sign in"}</button>
+        </form>
+        <p className="muted safety-copy">{SAFETY_NOTICE}</p>
+      </section>
+    </main>
+  );
+}
+
+// PUBLIC_INTERFACE
 function App() {
   /** Render the authenticated role-aware PPE safety POC interface and permitted workflows. */
   const [role, setRole] = useState<Role | null>(initialRole);
@@ -398,6 +476,24 @@ function App() {
   }, [role]);
 
   useEffect(() => {
+    if (AUTH_MODE !== "supabase" || !supabaseClient) return undefined;
+    let active = true;
+    void (async () => {
+      const { data } = await supabaseClient!.auth.getSession();
+      if (!active || !data.session) return;
+      try {
+        const me = await fetchMe(data.session.access_token);
+        setRole(me.role);
+      } catch {
+        await supabaseClient!.auth.signOut();
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     const handleHistory = () => {
       const pathView = viewForPath(window.location.pathname);
       if (pathView) setView(pathView);
@@ -420,8 +516,19 @@ function App() {
     setNotice(`${ROLE_LABELS[nextRole]} demonstration role selected.`);
   };
 
+  const handleSupabaseAuthenticated = (me: Me) => {
+    setRole(me.role);
+    const defaultView = NAVIGATION.find((item) => item.roles.includes(me.role))?.view ?? "dashboard";
+    navigate(defaultView);
+    setNotice(`Signed in as ${ROLE_LABELS[me.role]}.`);
+  };
+
   const logout = () => {
-    window.sessionStorage.removeItem("ppe-demo-role");
+    if (AUTH_MODE === "supabase" && supabaseClient) {
+      void supabaseClient.auth.signOut();
+    } else {
+      window.sessionStorage.removeItem("ppe-demo-role");
+    }
     setRole(null);
     window.history.pushState({}, "", "/login");
   };
@@ -582,7 +689,7 @@ function App() {
     try {
       const response = await fetch(`${API_URL}/api/v1/reports/exports`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Demo-Role": role },
+        headers: { "Content-Type": "application/json", ...(await resolveAuthHeader(role)) },
         body: JSON.stringify({}),
       });
       if (!response.ok) throw new Error("The aggregate export could not be generated.");
@@ -601,7 +708,11 @@ function App() {
     }
   };
 
-  if (!role) return <Login onLogin={changeRole} />;
+  if (!role) {
+    return AUTH_MODE === "supabase"
+      ? <SupabaseLogin onAuthenticated={handleSupabaseAuthenticated} />
+      : <Login onLogin={changeRole} />;
+  }
 
   const canAccessView = allowedNavigation.some((item) => item.view === view);
   const activeView = canAccessView ? view : allowedNavigation[0]?.view ?? "dashboard";
@@ -792,7 +903,12 @@ function App() {
         <nav aria-label="Primary navigation">
           {allowedNavigation.map((item) => <button className={`nav-item ${activeView === item.view ? "active" : ""}`} key={item.view} type="button" onClick={() => navigate(item.view)}>{item.label}</button>)}
         </nav>
-        <div className="session-panel"><label htmlFor="active-role">Demonstration role<select id="active-role" value={role} onChange={(event) => changeRole(event.target.value as Role)}>{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><button className="text-button" type="button" onClick={logout}>End POC session</button></div>
+        <div className="session-panel">
+          {AUTH_MODE === "demo"
+            ? <label htmlFor="active-role">Demonstration role<select id="active-role" value={role} onChange={(event) => changeRole(event.target.value as Role)}>{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            : <p className="muted">Signed in as {ROLE_LABELS[role]}.</p>}
+          <button className="text-button" type="button" onClick={logout}>{AUTH_MODE === "supabase" ? "Sign out" : "End POC session"}</button>
+        </div>
       </aside>
       <main className="content">
         <header className="topbar"><div><span className="role-badge">{ROLE_LABELS[role]}</span><p className="muted">Authenticated POC view; permissions are enforced by the API.</p></div><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadForRole(role)}>{loading ? "Refreshing…" : "Refresh"}</button></header>
@@ -844,7 +960,7 @@ function EvidenceLink({ alertId, role, onError }: { alertId: string; role: Role;
 
   const viewEvidence = async () => {
     try {
-      const response = await fetch(`${API_URL}/api/v1/alerts/${alertId}/evidence`, { headers: { "X-Demo-Role": role } });
+      const response = await fetch(`${API_URL}/api/v1/alerts/${alertId}/evidence`, { headers: await resolveAuthHeader(role) });
       if (!response.ok) {
         setExpired(true);
         throw new Error("Privacy-processed evidence is unavailable or expired.");

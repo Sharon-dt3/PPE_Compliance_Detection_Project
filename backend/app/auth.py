@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import Annotated, Callable
 
 import jwt
@@ -34,6 +35,38 @@ class AuthenticatedActor:
     role: Role
 
 
+@lru_cache(maxsize=1)
+def _jwks_client(jwks_url: str) -> jwt.PyJWKClient:
+    """Build and cache one JWKS client per configured endpoint for signing-key lookups."""
+    return jwt.PyJWKClient(jwks_url)
+
+
+def _decode_supabase_jwt(token: str) -> dict[str, object]:
+    """Verify a bearer token's signature against the identity provider's published JWKS.
+
+    Verification never relies on a shared secret: the token's ``kid`` header selects the
+    matching public key from the provider's JWKS endpoint, so the backend only ever holds
+    public material and key rotation on the provider side requires no redeployment here.
+    """
+    jwks_url = settings.resolve_jwks_url()
+    if not jwks_url:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication is not configured.")
+
+    algorithms = [value.strip() for value in settings.supabase_jwt_algorithms.split(",") if value.strip()]
+    try:
+        signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=algorithms,
+            audience=settings.supabase_jwt_audience,
+        )
+    except jwt.PyJWKClientError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication is not configured.") from error
+    except jwt.PyJWTError as error:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="The access token is invalid or expired.") from error
+
+
 def current_actor(
     authorization: Annotated[str | None, Header()] = None,
     x_demo_role: Annotated[str | None, Header()] = None,
@@ -48,21 +81,11 @@ def current_actor(
 
     if settings.auth_mode != "supabase":
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication is not configured.")
-    if not settings.supabase_jwt_secret:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication is not configured.")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="A bearer token is required.")
 
     token = authorization.removeprefix("Bearer ").strip()
-    try:
-        claims = jwt.decode(
-            token,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
-            audience=settings.supabase_jwt_audience,
-        )
-    except jwt.PyJWTError as error:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="The access token is invalid or expired.") from error
+    claims = _decode_supabase_jwt(token)
 
     subject = claims.get("sub")
     if not isinstance(subject, str) or not subject:

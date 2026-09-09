@@ -23,8 +23,10 @@ class Settings(BaseSettings):
     private_evidence_directory: str = "./data/private-evidence"
 
     auth_mode: str = "demo"
-    supabase_jwt_secret: str = ""
+    supabase_url: str = ""
+    supabase_jwks_url: str = ""
     supabase_jwt_audience: str = "authenticated"
+    supabase_jwt_algorithms: str = "RS256,ES256"
 
     detection_provider: str = "demo"
     demo_mode: bool = True
@@ -38,6 +40,14 @@ class Settings(BaseSettings):
     face_detector_confidence: float = 0.5
     face_blur_padding_ratio: float = 0.15
     face_blur_kernel_size: int = 31
+
+    def resolve_jwks_url(self) -> str:
+        """Return the configured or provider-derived JWKS endpoint, or an empty string."""
+        if self.supabase_jwks_url:
+            return self.supabase_jwks_url
+        if self.supabase_url:
+            return f"{self.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
+        return ""
 
 
 settings = Settings()

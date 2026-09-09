@@ -8,6 +8,7 @@ A safety-first, non-identifying proof of concept for manual CCTV still/video pro
 
 - Role-aware React and TypeScript POC workflows for private JPEG, PNG, MP4, and MOV submission, alert review, aggregate reporting, configuration, model evaluation, and restricted audit review.
 - FastAPI API with OpenAPI routes at `/docs`.
+- JWKS-verified Supabase authentication with server-side role assignment (`/api/v1/users`, `/api/v1/me`); a local demo role selector remains for zero-setup development.
 - Durable zones, policy versions, sources, media jobs, alerts, private evidence metadata, and aggregate metrics.
 - SQLite default for zero-cost local development; configurable PostgreSQL URL for shared environments.
 - Celery/Redis asynchronous processing boundary.
@@ -37,6 +38,20 @@ The configured face assets must be the approved OpenCV DNN ResNet SSD Caffe file
 
 If either asset is absent, unreadable, or errors during processing, the alert remains available as non-identifying metadata but **no evidence is stored or displayed**.
 
+## Authentication
+
+Local development defaults to `PPE_AUTH_MODE=demo` on the backend and `VITE_AUTH_MODE=demo` on the
+frontend: the UI shows a labeled, non-production role selector and the API trusts an `X-Demo-Role`
+header. This must never be enabled outside local development.
+
+For a shared deployment, set `PPE_AUTH_MODE=supabase` and `VITE_AUTH_MODE=supabase`. The backend
+verifies every bearer token's signature against the identity provider's published JWKS endpoint
+(`PPE_SUPABASE_URL`, or an explicit `PPE_SUPABASE_JWKS_URL`) — never a shared secret, so the backend
+only ever holds public key material. A verified token still grants nothing on its own: the caller's
+role is looked up server-side from the `application_users` table, never trusted from a client-supplied
+JWT claim. An administrator must create that row first, through `POST /api/v1/users`, using the new
+identity's provider subject (JWT `sub`); until then, a real sign-in resolves to `403`.
+
 ## Run locally
 
 Create environment values from `backend/.env.example`, then start the API:
@@ -65,7 +80,7 @@ cd backend
 celery -A app.worker.celery_app beat --loglevel=INFO
 ```
 
-Run the frontend in a separate terminal:
+Run the frontend in a separate terminal (create environment values from `frontend/.env.example` for a real Supabase sign-in; the defaults need no configuration):
 
 ```bash
 cd frontend
@@ -78,6 +93,7 @@ Open `http://localhost:5173`; API documentation is available at `http://localhos
 ## POC safety boundaries
 
 - Live RTSP/VMS integration is not enabled.
+- No route trusts a client-supplied role claim; every role is resolved server-side against the application's own role-assignment table, and only an administrator can create or change one.
 - Real PPE model outputs are POC decision-support signals, never automated enforcement.
 - Missing PPE is not inferred from a weak absence signal; ambiguous results remain `unknown`.
 - The simple initial provider produces aggregate POC results and must be benchmarked before any pilot.

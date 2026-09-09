@@ -15,11 +15,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit import record_actor_audit_event
-from app.auth import AuthenticatedActor, Role, require_role
+from app.auth import AuthenticatedActor, Role, current_actor, require_role
 from app.config import settings
 from app.database import get_session, initialise_database
 from app.media_validation import validate_media_upload, validate_video_file
 from app.models import (
+    ApplicationUser,
     AuditEvent,
     CameraSource,
     ComplianceAlert,
@@ -219,6 +220,38 @@ class ModelEvaluationResponse(ModelEvaluationRequest):
     created_at: datetime
 
 
+class MeResponse(BaseModel):
+    """The authenticated caller's own server-resolved identity and role."""
+
+    reference: str
+    role: str
+
+
+class ApplicationUserResponse(BaseModel):
+    """Administrator view of one server-side role assignment."""
+
+    id: str
+    auth_subject: str
+    role: str
+    enabled: bool
+    created_at: datetime
+
+
+class ApplicationUserCreateRequest(BaseModel):
+    """Administrator input assigning a role to a verified identity-provider subject."""
+
+    auth_subject: str = Field(min_length=1, max_length=128, description="The identity provider's stable subject (JWT `sub`) claim.")
+    role: Role
+    enabled: bool = True
+
+
+class ApplicationUserUpdateRequest(BaseModel):
+    """Administrator changes to an existing role assignment."""
+
+    role: Role | None = None
+    enabled: bool | None = None
+
+
 class AuditEventResponse(BaseModel):
     """Restricted, non-identifying operational audit event representation."""
 
@@ -241,6 +274,7 @@ app = FastAPI(
     openapi_tags=[
         {"name": "Health", "description": "Service health and readiness."},
         {"name": "Configuration", "description": "Configured safety zones and sources."},
+        {"name": "Administration", "description": "Server-side identity role assignments."},
         {"name": "Media jobs", "description": "Private manual-upload media processing."},
         {"name": "Alerts", "description": "Reviewable non-identifying safety alerts and privacy-gated evidence."},
         {"name": "Reports", "description": "Aggregate safety metrics only."},
@@ -268,6 +302,91 @@ async def startup() -> None:
 def health_check() -> dict[str, str]:
     """Return service health for local development and deployment checks."""
     return {"status": "healthy"}
+
+
+@app.get("/api/v1/me", response_model=MeResponse, tags=["Configuration"], summary="Get the authenticated caller's role")
+# PUBLIC_INTERFACE
+def get_me(actor: AuthenticatedActor = Depends(current_actor)) -> MeResponse:
+    """Return the caller's server-resolved reference and role for client-side navigation only.
+
+    This is not an authorization decision: every route independently enforces its own
+    required roles server-side regardless of what this endpoint returns.
+    """
+    return MeResponse(reference=actor.reference, role=actor.role.value)
+
+
+@app.get("/api/v1/users", response_model=list[ApplicationUserResponse], tags=["Administration"], summary="List role assignments")
+# PUBLIC_INTERFACE
+def list_users(
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> list[ApplicationUserResponse]:
+    """Return every configured server-side role assignment for administrator review."""
+    users = session.scalars(select(ApplicationUser).order_by(ApplicationUser.created_at)).all()
+    return [_user_response(user) for user in users]
+
+
+@app.post(
+    "/api/v1/users",
+    response_model=ApplicationUserResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Administration"],
+    summary="Assign a role to an identity-provider subject",
+)
+# PUBLIC_INTERFACE
+def create_user(
+    request: ApplicationUserCreateRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> ApplicationUserResponse:
+    """Create one server-side role assignment for a verified identity-provider subject.
+
+    The role a client-supplied JWT claims is never trusted; only a row created here through
+    an authenticated administrator determines what an identity is permitted to do.
+    """
+    if session.scalar(select(ApplicationUser).where(ApplicationUser.auth_subject == request.auth_subject)):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This identity already has an assigned role.")
+    user = ApplicationUser(auth_subject=request.auth_subject, role=request.role.value, enabled=request.enabled)
+    session.add(user)
+    session.flush()
+    record_actor_audit_event(
+        session, "user.role_assigned", "application_user", user.id, actor, f"Role {request.role.value} assigned."
+    )
+    session.commit()
+    return _user_response(user)
+
+
+@app.patch(
+    "/api/v1/users/{user_id}",
+    response_model=ApplicationUserResponse,
+    tags=["Administration"],
+    summary="Update a role assignment",
+)
+# PUBLIC_INTERFACE
+def update_user(
+    user_id: str,
+    request: ApplicationUserUpdateRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> ApplicationUserResponse:
+    """Update an existing role assignment's role or enabled state, fully audited."""
+    user = session.get(ApplicationUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This role assignment does not exist.")
+    if user.auth_subject == actor.reference and request.enabled is False:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="You cannot disable your own administrator access.")
+
+    changes: list[str] = []
+    if request.role is not None and request.role.value != user.role:
+        user.role = request.role.value
+        changes.append(f"role={request.role.value}")
+    if request.enabled is not None and request.enabled != user.enabled:
+        user.enabled = request.enabled
+        changes.append(f"enabled={request.enabled}")
+    if changes:
+        record_actor_audit_event(session, "user.role_updated", "application_user", user.id, actor, "; ".join(changes))
+    session.commit()
+    return _user_response(user)
 
 
 @app.get("/api/v1/zones", response_model=list[ZoneResponse], tags=["Configuration"], summary="List safety zones")
@@ -835,6 +954,13 @@ def _policy_response(policy: ZonePolicy) -> PolicyResponse:
 def _zone_response(zone: Zone, policy: ZonePolicy) -> ZoneResponse:
     """Convert a safety zone and its active policy to the public configuration shape."""
     return ZoneResponse(id=zone.id, name=zone.name, description=zone.description, policy=_policy_response(policy))
+
+
+def _user_response(user: ApplicationUser) -> ApplicationUserResponse:
+    """Convert a persisted role assignment to its administrator-facing representation."""
+    return ApplicationUserResponse(
+        id=user.id, auth_subject=user.auth_subject, role=user.role, enabled=user.enabled, created_at=user.created_at
+    )
 
 
 def _job_response(job: MediaJob) -> MediaJobResponse:
