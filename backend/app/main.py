@@ -30,9 +30,11 @@ from app.models import (
     MediaJob,
     MetricRollup,
     ModelEvaluation,
+    PlatformSettings,
     Zone,
     ZonePolicy,
 )
+from app.platform_settings import get_platform_settings
 from app.reporting import AggregateReportingService, ReportFilters
 from app.storage import PrivateMediaStorage
 from app.worker import process_media_job_task
@@ -252,6 +254,54 @@ class ApplicationUserUpdateRequest(BaseModel):
     enabled: bool | None = None
 
 
+class RetentionSettingsResponse(BaseModel):
+    """Current administrator-configurable retention durations."""
+
+    raw_media_retention_hours: int
+    frame_observation_retention_hours: int
+    updated_at: datetime
+
+
+class RetentionSettingsUpdateRequest(BaseModel):
+    """Administrator changes to global retention durations.
+
+    Face-blurred evidence retention is intentionally excluded: it remains set per zone
+    policy version (24-72 hours) rather than as a global override.
+    """
+
+    raw_media_retention_hours: int | None = Field(default=None, ge=1, le=168, description="Hours before a raw upload is deleted.")
+    frame_observation_retention_hours: int | None = Field(
+        default=None, ge=1, le=168, description="Hours before short-lived frame/person summaries are deleted."
+    )
+
+
+class InferenceSettingsResponse(BaseModel):
+    """Current administrator-configurable PPE detection provider configuration."""
+
+    detection_provider: str
+    demo_mode: bool
+    hf_model_repository: str
+    hf_model_filename: str
+    local_model_path: str
+    detection_confidence_threshold: float
+    updated_at: datetime
+
+
+class InferenceSettingsUpdateRequest(BaseModel):
+    """Administrator changes to the active PPE detection provider configuration.
+
+    Real inference stays gated behind an explicit ``demo_mode=false``; misconfiguration
+    fails a media job safely rather than falling back to a substitute provider.
+    """
+
+    detection_provider: str | None = Field(default=None, pattern="^(demo|ultralytics)$")
+    demo_mode: bool | None = None
+    hf_model_repository: str | None = Field(default=None, max_length=200)
+    hf_model_filename: str | None = Field(default=None, max_length=200)
+    local_model_path: str | None = Field(default=None, max_length=500)
+    detection_confidence_threshold: float | None = Field(default=None, ge=0, le=1)
+
+
 class AuditEventResponse(BaseModel):
     """Restricted, non-identifying operational audit event representation."""
 
@@ -387,6 +437,110 @@ def update_user(
         record_actor_audit_event(session, "user.role_updated", "application_user", user.id, actor, "; ".join(changes))
     session.commit()
     return _user_response(user)
+
+
+@app.get(
+    "/api/v1/settings/retention",
+    response_model=RetentionSettingsResponse,
+    tags=["Administration"],
+    summary="Get retention settings",
+)
+# PUBLIC_INTERFACE
+def get_retention_settings(
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER)),
+) -> RetentionSettingsResponse:
+    """Return the active global retention durations for administrator or governance review."""
+    config = get_platform_settings(session)
+    session.commit()
+    return _retention_settings_response(config)
+
+
+@app.patch(
+    "/api/v1/settings/retention",
+    response_model=RetentionSettingsResponse,
+    tags=["Administration"],
+    summary="Update retention settings",
+)
+# PUBLIC_INTERFACE
+def update_retention_settings(
+    request: RetentionSettingsUpdateRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> RetentionSettingsResponse:
+    """Update global retention durations at runtime without a redeploy, fully audited."""
+    config = get_platform_settings(session)
+    changes: list[str] = []
+    if request.raw_media_retention_hours is not None and request.raw_media_retention_hours != config.raw_media_retention_hours:
+        config.raw_media_retention_hours = request.raw_media_retention_hours
+        changes.append(f"raw_media_retention_hours={request.raw_media_retention_hours}")
+    if (
+        request.frame_observation_retention_hours is not None
+        and request.frame_observation_retention_hours != config.frame_observation_retention_hours
+    ):
+        config.frame_observation_retention_hours = request.frame_observation_retention_hours
+        changes.append(f"frame_observation_retention_hours={request.frame_observation_retention_hours}")
+    if changes:
+        config.updated_at = datetime.now(UTC)
+        record_actor_audit_event(session, "configuration.retention_updated", "platform_settings", config.id, actor, "; ".join(changes))
+    session.commit()
+    return _retention_settings_response(config)
+
+
+@app.get(
+    "/api/v1/settings/inference",
+    response_model=InferenceSettingsResponse,
+    tags=["Administration"],
+    summary="Get inference provider configuration",
+)
+# PUBLIC_INTERFACE
+def get_inference_settings(
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR, Role.MODEL_EVALUATOR)),
+) -> InferenceSettingsResponse:
+    """Return the active PPE detection provider configuration for administrator or evaluator review."""
+    config = get_platform_settings(session)
+    session.commit()
+    return _inference_settings_response(config)
+
+
+@app.patch(
+    "/api/v1/settings/inference",
+    response_model=InferenceSettingsResponse,
+    tags=["Administration"],
+    summary="Update inference provider configuration",
+)
+# PUBLIC_INTERFACE
+def update_inference_settings(
+    request: InferenceSettingsUpdateRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> InferenceSettingsResponse:
+    """Update the active PPE detection provider configuration at runtime, fully audited.
+
+    A misconfigured combination (for example, an unreachable Hugging Face repository) is
+    not validated here: it fails the next media job safely and visibly instead, per the
+    existing detector fail-closed boundary.
+    """
+    config = get_platform_settings(session)
+    changes: list[str] = []
+    for field_name in (
+        "detection_provider",
+        "demo_mode",
+        "hf_model_repository",
+        "hf_model_filename",
+        "local_model_path",
+        "detection_confidence_threshold",
+    ):
+        new_value = getattr(request, field_name)
+        if new_value is not None and new_value != getattr(config, field_name):
+            setattr(config, field_name, new_value)
+            changes.append(f"{field_name}={new_value}")
+    if changes:
+        config.updated_at = datetime.now(UTC)
+        record_actor_audit_event(session, "configuration.inference_updated", "platform_settings", config.id, actor, "; ".join(changes))
+    session.commit()
+    return _inference_settings_response(config)
 
 
 @app.get("/api/v1/zones", response_model=list[ZoneResponse], tags=["Configuration"], summary="List safety zones")
@@ -609,7 +763,7 @@ async def create_media_job(
         content_type=validated.content_type,
         storage_key=storage_key,
         status=JobStatus.QUEUED.value,
-        expires_at=datetime.now(UTC) + timedelta(hours=settings.raw_media_retention_hours),
+        expires_at=datetime.now(UTC) + timedelta(hours=get_platform_settings(session).raw_media_retention_hours),
     )
     session.add(job)
     session.flush()
@@ -702,7 +856,9 @@ def cancel_media_job(
 # PUBLIC_INTERFACE
 def list_alerts(
     session: Session = Depends(get_session),
-    _: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR)),
+    _: AuthenticatedActor = Depends(
+        require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.DEMO_VIEWER)
+    ),
 ) -> list[AlertResponse]:
     """Return persisted non-identifying safety alerts without raw media locations."""
     alerts = session.scalars(select(ComplianceAlert).order_by(ComplianceAlert.created_at.desc())).all()
@@ -756,6 +912,35 @@ def resolve_alert(
     return _alert_response(alert)
 
 
+@app.post(
+    "/api/v1/alerts/{alert_id}/evidence/approve-demo",
+    response_model=AlertResponse,
+    tags=["Alerts"],
+    summary="Approve alert evidence for demonstration-viewer access",
+)
+# PUBLIC_INTERFACE
+def approve_alert_evidence_for_demo(
+    alert_id: str,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.ADMINISTRATOR)),
+) -> AlertResponse:
+    """Mark one alert's current evidence as pre-approved for the demonstration-viewer role.
+
+    The demonstration-viewer role never gets standing evidence access: each snapshot must be
+    explicitly approved here first, and approval does not survive evidence expiry or a new
+    snapshot being generated for the same alert.
+    """
+    alert = _get_alert_or_404(session, alert_id)
+    snapshot = session.scalar(select(EvidenceSnapshot).where(EvidenceSnapshot.alert_id == alert.id))
+    if _evidence_missing_or_expired(snapshot):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Privacy-processed evidence is unavailable or expired.")
+    snapshot.demo_approved = True
+    record_actor_audit_event(session, "evidence.demo_approved", "evidence_snapshot", snapshot.id, actor, "Evidence approved for demonstration-viewer access.")
+    session.commit()
+    session.refresh(alert)
+    return _alert_response(alert)
+
+
 @app.get(
     "/api/v1/alerts/{alert_id}/evidence",
     tags=["Alerts"],
@@ -766,9 +951,12 @@ def resolve_alert(
 def get_alert_evidence(
     alert_id: str,
     session: Session = Depends(get_session),
-    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR)),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.DEMO_VIEWER)),
 ) -> Response:
     """Return only current, face-blurred evidence after separate reviewer authorization.
+
+    A supervisor may view any current, unexpired evidence. The demonstration-viewer role may
+    view only evidence an authorized reviewer has explicitly approved for demonstration use.
 
     Args:
         alert_id: Identifier of the reviewable non-compliance alert.
@@ -778,8 +966,10 @@ def get_alert_evidence(
     """
     alert = _get_alert_or_404(session, alert_id)
     snapshot = session.scalar(select(EvidenceSnapshot).where(EvidenceSnapshot.alert_id == alert.id))
-    if snapshot is None or not snapshot.blurred or snapshot.deleted_at is not None or snapshot.expires_at <= datetime.now(UTC):
+    if _evidence_missing_or_expired(snapshot):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Privacy-processed evidence is unavailable or expired.")
+    if actor.role is Role.DEMO_VIEWER and not snapshot.demo_approved:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This evidence has not been approved for demonstration viewing.")
     try:
         from app.evidence import EvidenceService
 
@@ -956,10 +1146,45 @@ def _zone_response(zone: Zone, policy: ZonePolicy) -> ZoneResponse:
     return ZoneResponse(id=zone.id, name=zone.name, description=zone.description, policy=_policy_response(policy))
 
 
+def _evidence_missing_or_expired(snapshot: EvidenceSnapshot | None) -> bool:
+    """Return whether evidence is absent, unblurred, deleted, or past its retention expiry.
+
+    Comparison is tolerant of SQLite's `DateTime` round-trip: a timezone-aware value the
+    application writes comes back without tzinfo on read, even though it is always logically
+    UTC. Treating a naive `expires_at` as UTC keeps this correct on SQLite and PostgreSQL alike.
+    """
+    if snapshot is None or not snapshot.blurred or snapshot.deleted_at is not None:
+        return True
+    expires_at = snapshot.expires_at if snapshot.expires_at.tzinfo else snapshot.expires_at.replace(tzinfo=UTC)
+    return expires_at <= datetime.now(UTC)
+
+
 def _user_response(user: ApplicationUser) -> ApplicationUserResponse:
     """Convert a persisted role assignment to its administrator-facing representation."""
     return ApplicationUserResponse(
         id=user.id, auth_subject=user.auth_subject, role=user.role, enabled=user.enabled, created_at=user.created_at
+    )
+
+
+def _retention_settings_response(config: PlatformSettings) -> RetentionSettingsResponse:
+    """Convert the singleton settings row to its retention-facing representation."""
+    return RetentionSettingsResponse(
+        raw_media_retention_hours=config.raw_media_retention_hours,
+        frame_observation_retention_hours=config.frame_observation_retention_hours,
+        updated_at=config.updated_at,
+    )
+
+
+def _inference_settings_response(config: PlatformSettings) -> InferenceSettingsResponse:
+    """Convert the singleton settings row to its inference-facing representation."""
+    return InferenceSettingsResponse(
+        detection_provider=config.detection_provider,
+        demo_mode=config.demo_mode,
+        hf_model_repository=config.hf_model_repository,
+        hf_model_filename=config.hf_model_filename,
+        local_model_path=config.local_model_path,
+        detection_confidence_threshold=config.detection_confidence_threshold,
+        updated_at=config.updated_at,
     )
 
 

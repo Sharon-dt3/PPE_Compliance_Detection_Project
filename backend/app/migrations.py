@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 from sqlalchemy import Connection, inspect, text
 
+from app.config import settings
+
 MIGRATION_TABLE = "schema_migrations"
 
 
@@ -25,6 +27,8 @@ def apply_migrations(connection: Connection) -> None:
         ("20260909_frame_observations", _upgrade_frame_observations),
         ("20260909_frame_observation_expiry", _upgrade_frame_observation_expiry),
         ("20260909_person_observations", _upgrade_person_observations),
+        ("20260909_platform_settings", _upgrade_platform_settings),
+        ("20260909_evidence_demo_approved", _upgrade_evidence_demo_approved),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -137,6 +141,50 @@ def _upgrade_person_observations(connection: Connection) -> None:
     connection.execute(
         text("CREATE INDEX IF NOT EXISTS ix_person_observations_expires_at ON person_observations (expires_at)")
     )
+
+
+def _upgrade_platform_settings(connection: Connection) -> None:
+    """Create the singleton administrator-configurable retention/inference settings row."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS platform_settings ("
+            "id VARCHAR(20) PRIMARY KEY, "
+            "raw_media_retention_hours INTEGER NOT NULL, "
+            "frame_observation_retention_hours INTEGER NOT NULL, "
+            "detection_provider VARCHAR(20) NOT NULL, "
+            "demo_mode BOOLEAN NOT NULL, "
+            "hf_model_repository VARCHAR(200) NOT NULL, "
+            "hf_model_filename VARCHAR(200) NOT NULL, "
+            "local_model_path VARCHAR(500) NOT NULL DEFAULT '', "
+            "detection_confidence_threshold FLOAT NOT NULL, "
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO platform_settings ("
+            "id, raw_media_retention_hours, frame_observation_retention_hours, detection_provider, "
+            "demo_mode, hf_model_repository, hf_model_filename, local_model_path, detection_confidence_threshold"
+            ") SELECT 'default', :raw_media_retention_hours, :frame_observation_retention_hours, :detection_provider, "
+            ":demo_mode, :hf_model_repository, :hf_model_filename, :local_model_path, :detection_confidence_threshold "
+            "WHERE NOT EXISTS (SELECT 1 FROM platform_settings WHERE id = 'default')"
+        ),
+        {
+            "raw_media_retention_hours": settings.raw_media_retention_hours,
+            "frame_observation_retention_hours": settings.frame_observation_retention_hours,
+            "detection_provider": settings.detection_provider,
+            "demo_mode": settings.demo_mode,
+            "hf_model_repository": settings.hf_model_repository,
+            "hf_model_filename": settings.hf_model_filename,
+            "local_model_path": settings.local_model_path,
+            "detection_confidence_threshold": settings.detection_confidence_threshold,
+        },
+    )
+
+
+def _upgrade_evidence_demo_approved(connection: Connection) -> None:
+    """Add the demonstration-viewer approval flag to legacy evidence snapshots."""
+    _add_missing_columns(connection, "evidence_snapshots", {"demo_approved": "BOOLEAN DEFAULT 0 NOT NULL"})
 
 
 def _add_missing_columns(connection: Connection, table: str, additions: dict[str, str]) -> None:

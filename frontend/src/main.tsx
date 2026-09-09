@@ -134,6 +134,30 @@ type AuditEvent = {
   created_at: string;
 };
 
+type PlatformUser = {
+  id: string;
+  auth_subject: string;
+  role: Role;
+  enabled: boolean;
+  created_at: string;
+};
+
+type RetentionSettings = {
+  raw_media_retention_hours: number;
+  frame_observation_retention_hours: number;
+  updated_at: string;
+};
+
+type InferenceSettings = {
+  detection_provider: string;
+  demo_mode: boolean;
+  hf_model_repository: string;
+  hf_model_filename: string;
+  local_model_path: string;
+  detection_confidence_threshold: number;
+  updated_at: string;
+};
+
 type View =
   | "dashboard"
   | "media"
@@ -145,6 +169,7 @@ type View =
   | "models"
   | "model-evaluation"
   | "retention"
+  | "users"
   | "audit";
 
 type NavigationItem = {
@@ -166,13 +191,14 @@ const NAVIGATION: NavigationItem[] = [
   { view: "dashboard", label: "Dashboard", roles: ["hse_manager", "administrator", "governance_reviewer", "demonstration_viewer"] },
   { view: "media", label: "Media jobs", roles: ["safety_supervisor", "hse_manager", "administrator"] },
   { view: "media-new", label: "New upload", roles: ["safety_supervisor", "hse_manager", "administrator"] },
-  { view: "alerts", label: "Safety alerts", roles: ["safety_supervisor", "hse_manager", "administrator"] },
+  { view: "alerts", label: "Safety alerts", roles: ["safety_supervisor", "hse_manager", "administrator", "demonstration_viewer"] },
   { view: "sources", label: "Sources", roles: ["administrator"] },
   { view: "zones", label: "Zones", roles: ["administrator"] },
   { view: "policies", label: "Policies", roles: ["administrator"] },
   { view: "models", label: "Model registry", roles: ["administrator", "model_evaluator"] },
   { view: "model-evaluation", label: "Model evaluation", roles: ["model_evaluator"] },
   { view: "retention", label: "Retention", roles: ["administrator", "governance_reviewer"] },
+  { view: "users", label: "Users & roles", roles: ["administrator"] },
   { view: "audit", label: "Audit records", roles: ["administrator", "governance_reviewer"] },
 ];
 
@@ -188,6 +214,7 @@ const routeFor = (view: View): string => {
     models: "/admin/models",
     "model-evaluation": "/model-evaluation",
     retention: "/admin/retention",
+    users: "/admin/users",
     audit: "/admin/audit",
   };
   return routes[view];
@@ -205,6 +232,7 @@ const viewForPath = (path: string): View | null => {
     models: true,
     "model-evaluation": true,
     retention: true,
+    users: true,
     audit: true,
   }) as View[]).find((view) => routeFor(view) === path);
   return match ?? null;
@@ -419,6 +447,9 @@ function App() {
   const [alertMetrics, setAlertMetrics] = useState<AlertMetrics | null>(null);
   const [evaluations, setEvaluations] = useState<ModelEvaluation[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [users, setUsers] = useState<PlatformUser[]>([]);
+  const [retentionSettings, setRetentionSettings] = useState<RetentionSettings | null>(null);
+  const [inferenceSettings, setInferenceSettings] = useState<InferenceSettings | null>(null);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [frames, setFrames] = useState<FrameSummary[]>([]);
   const [notice, setNotice] = useState("Select a permitted workflow.");
@@ -443,7 +474,7 @@ function App() {
       const zonePromise = request<Zone[]>(activeRole, "/api/v1/zones");
       const sourcesAllowed = ["safety_supervisor", "hse_manager", "administrator"].includes(activeRole);
       const dashboardAllowed = ["hse_manager", "administrator", "governance_reviewer", "demonstration_viewer"].includes(activeRole);
-      const alertsAllowed = ["safety_supervisor", "hse_manager", "administrator"].includes(activeRole);
+      const alertsAllowed = ["safety_supervisor", "hse_manager", "administrator", "demonstration_viewer"].includes(activeRole);
 
       const [zoneData, sourceData, jobData, alertData, reportData, trendData, metricsData] = await Promise.all([
         zonePromise,
@@ -594,14 +625,15 @@ function App() {
   const createSource = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!role) return;
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setLoading(true);
     try {
       await request<Source>(role, "/api/v1/sources", {
         method: "POST",
         body: JSON.stringify({ name: form.get("name"), zone_id: form.get("zone_id"), enabled: true }),
       });
-      event.currentTarget.reset();
+      formElement.reset();
       setNotice("Camera source configuration created and audited.");
       await loadForRole(role);
     } catch (error) {
@@ -614,14 +646,15 @@ function App() {
   const createZone = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!role) return;
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setLoading(true);
     try {
       await request<Zone>(role, "/api/v1/zones", {
         method: "POST",
         body: JSON.stringify({ name: form.get("name"), description: form.get("description"), enabled: true }),
       });
-      event.currentTarget.reset();
+      formElement.reset();
       setNotice("Safety zone and initial policy created and audited.");
       await loadForRole(role);
     } catch (error) {
@@ -678,6 +711,154 @@ function App() {
       setAuditEvents(await request<AuditEvent[]>(role, "/api/v1/audit-events"));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Audit records are unavailable.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadUsers = async () => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      setUsers(await request<PlatformUser[]>(role, "/api/v1/users"));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Role assignments are unavailable.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createUser = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!role) return;
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    setLoading(true);
+    try {
+      await request<PlatformUser>(role, "/api/v1/users", {
+        method: "POST",
+        body: JSON.stringify({ auth_subject: form.get("auth_subject"), role: form.get("role"), enabled: true }),
+      });
+      formElement.reset();
+      setNotice("Role assignment created and audited.");
+      await loadUsers();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to create the role assignment.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateUserRole = async (user: PlatformUser, nextRole: Role) => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      await request<PlatformUser>(role, `/api/v1/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ role: nextRole }) });
+      setNotice(`Role updated for ${user.auth_subject}.`);
+      await loadUsers();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to update this role assignment.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleUserEnabled = async (user: PlatformUser) => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      await request<PlatformUser>(role, `/api/v1/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !user.enabled }) });
+      setNotice(user.enabled ? `Access disabled for ${user.auth_subject}.` : `Access re-enabled for ${user.auth_subject}.`);
+      await loadUsers();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to update this role assignment.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadRetentionSettings = async () => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      setRetentionSettings(await request<RetentionSettings>(role, "/api/v1/settings/retention"));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Retention settings are unavailable.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateRetentionSettingsForm = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!role) return;
+    const form = new FormData(event.currentTarget);
+    setLoading(true);
+    try {
+      setRetentionSettings(
+        await request<RetentionSettings>(role, "/api/v1/settings/retention", {
+          method: "PATCH",
+          body: JSON.stringify({
+            raw_media_retention_hours: Number(form.get("raw_media_retention_hours")),
+            frame_observation_retention_hours: Number(form.get("frame_observation_retention_hours")),
+          }),
+        }),
+      );
+      setNotice("Retention settings updated and audited.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to update retention settings.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadInferenceSettings = async () => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      setInferenceSettings(await request<InferenceSettings>(role, "/api/v1/settings/inference"));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Inference provider configuration is unavailable.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateInferenceSettingsForm = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!role) return;
+    const form = new FormData(event.currentTarget);
+    setLoading(true);
+    try {
+      setInferenceSettings(
+        await request<InferenceSettings>(role, "/api/v1/settings/inference", {
+          method: "PATCH",
+          body: JSON.stringify({
+            detection_provider: form.get("detection_provider"),
+            demo_mode: form.get("demo_mode") === "on",
+            hf_model_repository: form.get("hf_model_repository"),
+            hf_model_filename: form.get("hf_model_filename"),
+            local_model_path: form.get("local_model_path"),
+            detection_confidence_threshold: Number(form.get("detection_confidence_threshold")),
+          }),
+        }),
+      );
+      setNotice("Inference provider configuration updated and audited.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to update the inference provider configuration.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const approveEvidenceForDemo = async (alert: Alert) => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      await request<Alert>(role, `/api/v1/alerts/${alert.id}/evidence/approve-demo`, { method: "POST" });
+      setNotice("Evidence approved for demonstration-viewer access.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to approve this evidence for demonstration viewing.");
     } finally {
       setLoading(false);
     }
@@ -828,6 +1009,7 @@ function App() {
             {role === "safety_supervisor" && <div className="button-stack">
               {alert.status === "open" && <button type="button" onClick={() => void updateAlert(alert, "acknowledgements")}>Acknowledge</button>}
               {["open", "acknowledged"].includes(alert.status) && <button className="secondary-button" type="button" onClick={() => void updateAlert(alert, "resolve")}>Resolve</button>}
+              {alert.evidence_available && <button className="secondary-button" type="button" onClick={() => void approveEvidenceForDemo(alert)}>Approve evidence for demo viewing</button>}
             </div>}
           </article>)}
         </div>}
@@ -869,6 +1051,28 @@ function App() {
     <>
       <PageHeader title="Model registry and limitations" description="POC model evaluations must be read alongside their class-level metrics, licensing, limitations, and approval status. No single headline accuracy is used." action={<button className="secondary-button" type="button" onClick={() => void loadEvaluations()}>Load evaluations</button>} />
       <section className="panel">
+        <div className="panel-heading"><h2>Active inference provider configuration</h2><button className="secondary-button" type="button" onClick={() => void loadInferenceSettings()}>{inferenceSettings ? "Refresh" : "Load configuration"}</button></div>
+        {!inferenceSettings ? <EmptyState title="Configuration not loaded" text="Load the active detection-provider configuration to review or change it." /> : role === "administrator" ? (
+          <form onSubmit={updateInferenceSettingsForm} className="settings-form">
+            <label className="check-label"><input name="demo_mode" type="checkbox" defaultChecked={inferenceSettings.demo_mode} key={`demo-${inferenceSettings.updated_at}`} /> Demo mode (deterministic, no real model)</label>
+            <label>Detection provider<select name="detection_provider" defaultValue={inferenceSettings.detection_provider} key={`provider-${inferenceSettings.updated_at}`}><option value="demo">demo</option><option value="ultralytics">ultralytics</option></select></label>
+            <label>Hugging Face repository<input name="hf_model_repository" defaultValue={inferenceSettings.hf_model_repository} key={`repo-${inferenceSettings.updated_at}`} maxLength={200} /></label>
+            <label>Hugging Face filename<input name="hf_model_filename" defaultValue={inferenceSettings.hf_model_filename} key={`file-${inferenceSettings.updated_at}`} maxLength={200} /></label>
+            <label>Local model path (overrides Hugging Face when set)<input name="local_model_path" defaultValue={inferenceSettings.local_model_path} key={`local-${inferenceSettings.updated_at}`} maxLength={500} /></label>
+            <label>Confidence threshold<input name="detection_confidence_threshold" type="number" min="0" max="1" step="0.01" defaultValue={inferenceSettings.detection_confidence_threshold} key={`conf-${inferenceSettings.updated_at}`} required /></label>
+            <p className="muted">Real inference stays disabled while demo mode is checked. A misconfigured model fails the next media job safely rather than substituting another provider.</p>
+            <button disabled={loading} type="submit">Save configuration</button>
+          </form>
+        ) : (
+          <dl className="definition-list">
+            <div><dt>Mode</dt><dd>{inferenceSettings.demo_mode ? "Demo (deterministic)" : "Real inference"}</dd></div>
+            <div><dt>Provider</dt><dd>{inferenceSettings.detection_provider}</dd></div>
+            <div><dt>Model</dt><dd>{inferenceSettings.local_model_path || `${inferenceSettings.hf_model_repository}/${inferenceSettings.hf_model_filename}`}</dd></div>
+            <div><dt>Confidence threshold</dt><dd>{inferenceSettings.detection_confidence_threshold}</dd></div>
+          </dl>
+        )}
+      </section>
+      <section className="panel">
         {!evaluations.length ? <EmptyState title="No evaluations loaded" text="Load approved model evaluation metadata to review POC capability and limitations." /> : <div className="cards">
           {evaluations.map((evaluation) => <article className="model-card" key={evaluation.id}><Status status={evaluation.approval_state} /><h2>{evaluation.model_name} <span className="muted">v{evaluation.model_version}</span></h2><p>{evaluation.provider} · {evaluation.licence_status}</p><p><strong>Dataset:</strong> {evaluation.dataset_reference}</p><p><strong>Latency:</strong> {evaluation.latency_ms ?? "Not recorded"} ms · <strong>Sampling:</strong> {evaluation.effective_sampling_rate ?? "Not recorded"} FPS</p><h3>Class-level results</h3><table><thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th></tr></thead><tbody>{Object.entries(evaluation.class_metrics).map(([label, metrics]) => <tr key={label}><td>{label}</td><td>{metrics.precision ?? "—"}</td><td>{metrics.recall ?? "—"}</td><td>{metrics.f1 ?? "—"}</td></tr>)}</tbody></table><p className="muted"><strong>Limitations:</strong> {evaluation.limitations}</p></article>)}
         </div>}
@@ -878,7 +1082,71 @@ function App() {
 
   const renderModelEvaluation = () => <><PageHeader title="Model evaluation workflow" description="The evaluator role can record approved benchmark metadata through the API. This POC UI provides transparent review of stored class-level results and limitations." action={<button type="button" onClick={() => { navigate("models"); void loadEvaluations(); }}>Review evaluations</button>} /><section className="panel"><h2>Evaluation guardrails</h2><ul className="safety-list"><li>Use approved labeled datasets only.</li><li>Record per-class precision, recall, F1, latency, unknown rate, and camera-angle limitations.</li><li>Keep experimental and POC-only models clearly marked as not production-approved.</li><li>Do not use evaluation data for worker identification or performance assessment.</li></ul></section></>;
 
-  const renderRetention = () => <><PageHeader title="Retention and deletion controls" description="Raw uploaded media is deleted after processing according to approved retention. Privacy-processed evidence expires after its configured 24–72 hour period; aggregate metrics and audit records follow their own governance policy." /><section className="grid"><article className="panel"><h2>Automated controls</h2><ul className="safety-list"><li>Scheduled cleanup removes expired raw private media.</li><li>Expired evidence is deleted and becomes inaccessible through the reviewer API.</li><li>Expired evidence is displayed as unavailable, never as a broken image.</li><li>Retention outcomes are intended to be auditable by the governance workflow.</li></ul></article><article className="panel"><h2>POC limitation</h2><p className="muted">Retention configuration is represented through active zone-policy evidence periods. This POC does not provide a self-service global retention editor or storage administration interface.</p></article></section></>;
+  const renderRetention = () => (
+    <>
+      <PageHeader title="Retention and deletion controls" description="Raw uploaded media is deleted after processing according to approved retention. Privacy-processed evidence expires after its configured 24–72 hour period, set per zone policy version; aggregate metrics and audit records follow their own governance policy." />
+      <section className="grid">
+        <article className="panel">
+          <h2>Automated controls</h2>
+          <ul className="safety-list">
+            <li>Scheduled cleanup removes expired raw private media.</li>
+            <li>Expired evidence is deleted and becomes inaccessible through the reviewer API.</li>
+            <li>Expired evidence is displayed as unavailable, never as a broken image.</li>
+            <li>Retention outcomes are intended to be auditable by the governance workflow.</li>
+          </ul>
+        </article>
+        <article className="panel">
+          <div className="panel-heading"><h2>Global retention settings</h2><button className="secondary-button" type="button" onClick={() => void loadRetentionSettings()}>{retentionSettings ? "Refresh" : "Load settings"}</button></div>
+          {!retentionSettings ? <EmptyState title="Settings not loaded" text="Load the active global retention settings to review or change them." /> : role === "administrator" ? (
+            <form onSubmit={updateRetentionSettingsForm} className="settings-form">
+              <label>Raw media retention (hours)<input name="raw_media_retention_hours" type="number" min="1" max="168" defaultValue={retentionSettings.raw_media_retention_hours} key={`raw-${retentionSettings.updated_at}`} required /></label>
+              <label>Frame/person observation retention (hours)<input name="frame_observation_retention_hours" type="number" min="1" max="168" defaultValue={retentionSettings.frame_observation_retention_hours} key={`frame-${retentionSettings.updated_at}`} required /></label>
+              <p className="muted">Face-blurred evidence retention is not set here: it stays per zone policy version, 24–72 hours.</p>
+              <button disabled={loading} type="submit">Save retention settings</button>
+            </form>
+          ) : (
+            <dl className="definition-list">
+              <div><dt>Raw media retention</dt><dd>{retentionSettings.raw_media_retention_hours} hours</dd></div>
+              <div><dt>Frame/person observation retention</dt><dd>{retentionSettings.frame_observation_retention_hours} hours</dd></div>
+              <div><dt>Last updated</dt><dd>{formatDate(retentionSettings.updated_at)}</dd></div>
+            </dl>
+          )}
+        </article>
+      </section>
+    </>
+  );
+
+  const renderUsers = () => (
+    <>
+      <PageHeader title="Users and role assignments" description="No role is ever trusted from a signed-in identity's own claim. Only a role assignment created here determines what a verified identity is permitted to do." />
+      <section className="grid">
+        <article className="panel">
+          <div className="panel-heading"><h2>Configured role assignments</h2><button className="secondary-button" type="button" onClick={() => void loadUsers()}>{users.length ? "Refresh" : "Load users"}</button></div>
+          {!users.length ? <EmptyState title="No role assignments loaded" text="Load configured role assignments, or create the first one for a verified identity-provider subject." /> : <table>
+            <thead><tr><th>Identity subject</th><th>Role</th><th>Access</th><th>Created</th><th></th></tr></thead>
+            <tbody>
+              {users.map((user) => <tr key={user.id}>
+                <td>{user.auth_subject}</td>
+                <td><select value={user.role} onChange={(event) => void updateUserRole(user, event.target.value as Role)}>{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></td>
+                <td><Status status={user.enabled ? "enabled" : "disabled"} /></td>
+                <td>{formatDate(user.created_at)}</td>
+                <td><button className="text-button" type="button" onClick={() => void toggleUserEnabled(user)}>{user.enabled ? "Disable" : "Enable"}</button></td>
+              </tr>)}
+            </tbody>
+          </table>}
+        </article>
+        <article className="panel">
+          <h2>Assign a role</h2>
+          <form onSubmit={createUser}>
+            <label>Identity-provider subject (JWT `sub`)<input name="auth_subject" required minLength={1} maxLength={128} /></label>
+            <label>Role<select name="role" required defaultValue="safety_supervisor">{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <button disabled={loading} type="submit">Create role assignment</button>
+          </form>
+          <p className="muted">Find the subject in your identity provider's user record (for Supabase: Authentication → Users → the User UID).</p>
+        </article>
+      </section>
+    </>
+  );
 
   const renderAudit = () => <><PageHeader title="Restricted audit records" description="Audit records omit raw media, direct evidence URLs, biometric material, worker identities, and HR data." action={<button className="secondary-button" type="button" onClick={() => void loadAudit()}>Load audit records</button>} /><section className="panel">{!auditEvents.length ? <EmptyState title="No audit records loaded" text="Load recent restricted audit events to review permitted safety operations." /> : <table><thead><tr><th>When</th><th>Event</th><th>Entity</th><th>Role</th><th>Detail</th></tr></thead><tbody>{auditEvents.map((event) => <tr key={event.id}><td>{formatDate(event.created_at)}</td><td>{event.event_type}</td><td>{event.entity_type}</td><td>{event.actor_role}</td><td>{event.detail}</td></tr>)}</tbody></table>}</section></>;
 
@@ -893,6 +1161,7 @@ function App() {
     models: renderModels,
     "model-evaluation": renderModelEvaluation,
     retention: renderRetention,
+    users: renderUsers,
     audit: renderAudit,
   };
 

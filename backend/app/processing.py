@@ -25,6 +25,7 @@ from app.models import (
     PersonObservation,
     ZonePolicy,
 )
+from app.platform_settings import get_platform_settings
 
 
 def process_media_job(job_id: str) -> None:
@@ -43,7 +44,7 @@ def process_media_job(job_id: str) -> None:
             if policy is None:
                 raise RuntimeError("The job policy is unavailable.")
             media_path = str(Path(settings.private_media_directory) / job.storage_key)
-            detections = get_detection_provider().evaluate(media_path)
+            detections = get_detection_provider(session).evaluate(media_path)
             decision = SafetyDecisionService().evaluate(detections, policy)
             _persist_outcome(session, job, policy, detections, decision, media_path)
             session.commit()
@@ -215,7 +216,7 @@ def _persist_frame_observations(
     Person rows are ephemeral and frame-scoped: ``person_index`` is only the detector's
     per-frame ordinal position, never a tracking key carried across frames or jobs.
     """
-    expires_at = datetime.now(UTC) + timedelta(hours=settings.frame_observation_retention_hours)
+    expires_at = datetime.now(UTC) + timedelta(hours=get_platform_settings(session).frame_observation_retention_hours)
     existing_indexes = {
         index
         for index in session.scalars(

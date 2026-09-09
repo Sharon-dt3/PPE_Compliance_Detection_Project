@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from app.config import settings
+from sqlalchemy.orm import Session
 
 
 @dataclass(frozen=True)
@@ -101,12 +101,26 @@ class UltralyticsPpeProvider:
         "no vest": "no_vest",
     }
 
+    def __init__(
+        self,
+        *,
+        hf_model_repository: str,
+        hf_model_filename: str,
+        local_model_path: str,
+        confidence_threshold: float,
+    ) -> None:
+        """Capture the resolved, administrator-configured model selection for this run."""
+        self._hf_model_repository = hf_model_repository
+        self._hf_model_filename = hf_model_filename
+        self._local_model_path = local_model_path
+        self._confidence_threshold = confidence_threshold
+
     def evaluate(self, media_path: str) -> DetectionOutcome:
         """Run YOLO and return labeled boxes without assigning any persistent identity."""
         model = self._load_model()
         results = model.predict(
             source=media_path,
-            conf=settings.detection_confidence_threshold,
+            conf=self._confidence_threshold,
             verbose=False,
             stream=False,
         )
@@ -135,13 +149,11 @@ class UltralyticsPpeProvider:
             provider_version=self._model_location(),
         )
 
-    @staticmethod
-    def _model_location() -> str:
+    def _model_location(self) -> str:
         """Resolve the selected local or Hugging Face model identifier."""
-        return settings.local_model_path or f"{settings.hf_model_repository}/{settings.hf_model_filename}"
+        return self._local_model_path or f"{self._hf_model_repository}/{self._hf_model_filename}"
 
-    @staticmethod
-    def _load_model():
+    def _load_model(self):
         """Load the approved configured model without silently substituting a fallback."""
         try:
             from huggingface_hub import hf_hub_download
@@ -149,21 +161,34 @@ class UltralyticsPpeProvider:
         except ImportError as error:
             raise RuntimeError("The real inference dependencies are not installed.") from error
 
-        if settings.local_model_path:
-            model_path = Path(settings.local_model_path)
+        if self._local_model_path:
+            model_path = Path(self._local_model_path)
             if not model_path.is_file():
                 raise RuntimeError("The configured local PPE model file is unavailable.")
         else:
             model_path = Path(
-                hf_hub_download(repo_id=settings.hf_model_repository, filename=settings.hf_model_filename)
+                hf_hub_download(repo_id=self._hf_model_repository, filename=self._hf_model_filename)
             )
         return YOLO(str(model_path))
 
 
-def get_detection_provider() -> DetectionProvider:
-    """Return only the configured inference provider; unknown choices fail closed."""
-    if settings.demo_mode and settings.detection_provider == "demo":
+def get_detection_provider(session: Session) -> DetectionProvider:
+    """Return only the configured inference provider; unknown choices fail closed.
+
+    Configuration is read from the administrator-editable ``PlatformSettings`` row rather
+    than the environment directly, so a change made through ``/api/v1/settings/inference``
+    takes effect on the next job without a redeploy.
+    """
+    from app.platform_settings import get_platform_settings
+
+    config = get_platform_settings(session)
+    if config.demo_mode and config.detection_provider == "demo":
         return DemoDetectionProvider()
-    if not settings.demo_mode and settings.detection_provider == "ultralytics":
-        return UltralyticsPpeProvider()
+    if not config.demo_mode and config.detection_provider == "ultralytics":
+        return UltralyticsPpeProvider(
+            hf_model_repository=config.hf_model_repository,
+            hf_model_filename=config.hf_model_filename,
+            local_model_path=config.local_model_path,
+            confidence_threshold=config.detection_confidence_threshold,
+        )
     raise RuntimeError("No approved PPE inference provider is configured.")

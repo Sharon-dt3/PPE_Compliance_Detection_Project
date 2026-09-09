@@ -151,6 +151,7 @@ class EvidenceSnapshot(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    demo_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class MetricRollup(Base):
@@ -186,6 +187,27 @@ class FrameObservation(Base):
     confidence_summary: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PlatformSettings(Base):
+    """Singleton administrator-configurable runtime overrides for retention and inference.
+
+    Exactly one row exists (``id="default"``). It is seeded from the environment-configured
+    defaults on startup; an administrator may change it afterward without a redeploy.
+    """
+
+    __tablename__ = "platform_settings"
+
+    id: Mapped[str] = mapped_column(String(20), primary_key=True, default="default")
+    raw_media_retention_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_observation_retention_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    detection_provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    demo_mode: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    hf_model_repository: Mapped[str] = mapped_column(String(200), nullable=False)
+    hf_model_filename: Mapped[str] = mapped_column(String(200), nullable=False)
+    local_model_path: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    detection_confidence_threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class PersonObservation(Base):
