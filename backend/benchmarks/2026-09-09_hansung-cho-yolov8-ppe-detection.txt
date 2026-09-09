@@ -1,0 +1,22 @@
+Candidate: Hansung-Cho/yolov8-ppe-detection
+Sampled 300 of 1974 eligible held-out test images
+Random seed: 20260909  IoU threshold: 0.5  Confidence threshold: 0.25
+
+Per-class results:
+  helmet       TP= 379 FP= 271 FN= 293 precision=0.583 recall=0.564 f1=0.573 mean_TP_confidence=0.795 mean_FP_confidence=0.654
+  no_helmet    TP=   9 FP= 198 FN= 139 precision=0.043 recall=0.061 f1=0.051 mean_TP_confidence=0.619 mean_FP_confidence=0.567
+
+Total raw detections: 3426
+Unmapped-label detections (preserved as unknown_label, excluded from compliance calc): 772
+Detections below the 0.25 confidence threshold (excluded before matching): 0
+Latency: mean=69.5ms  min=55.9ms  max=1281.0ms  (CPU inference, single image per call)
+
+Representative failure-case filenames (false positive or missed detection present):
+  RPReplay_Final1667001201_MP4-263_jpg.rf.d288e173607052ddacfae77557f96a4b.jpg
+  ppe_0686_jpg.rf.fa92c2a9051846e95f88fcc36cf82f27.jpg
+  RTX7CCFN_jpg.rf.1ae9136e785a092a87c3692f325b516e.jpg
+  -2437-_png_jpg.rf.626b82da5cd1b4d1a6eebb5ec8683c65.jpg
+  -25-_png_jpg.rf.4dfee4569c9939722a5cedeb55d8a7dc.jpg
+  IMG_9950-1-_mp4-77_jpg.rf.4d12c4583c89ddfabd73fa48258cef49.jpg
+  TB2R28UvUOWBKNjSZKzXXXfWFXa_-1116877752_jpg.rf.4652f750833f204c8d5721c598de6b62.jpg
+  MX_img_107_jpg.rf.6dca56ab417587cbd5fc693664364449.jpg

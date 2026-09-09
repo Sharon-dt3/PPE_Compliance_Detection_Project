@@ -29,6 +29,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260909_person_observations", _upgrade_person_observations),
         ("20260909_platform_settings", _upgrade_platform_settings),
         ("20260909_evidence_demo_approved", _upgrade_evidence_demo_approved),
+        ("20260909_class_and_source_thresholds", _upgrade_class_and_source_thresholds),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -185,6 +186,12 @@ def _upgrade_platform_settings(connection: Connection) -> None:
 def _upgrade_evidence_demo_approved(connection: Connection) -> None:
     """Add the demonstration-viewer approval flag to legacy evidence snapshots."""
     _add_missing_columns(connection, "evidence_snapshots", {"demo_approved": "BOOLEAN DEFAULT 0 NOT NULL"})
+
+
+def _upgrade_class_and_source_thresholds(connection: Connection) -> None:
+    """Add per-class zone-policy and per-source confidence-threshold overrides (FR-DET-05)."""
+    _add_missing_columns(connection, "zone_policies", {"class_confidence_thresholds_json": "TEXT DEFAULT '{}' NOT NULL"})
+    _add_missing_columns(connection, "camera_sources", {"confidence_threshold_override": "FLOAT"})
 
 
 def _add_missing_columns(connection: Connection, table: str, additions: dict[str, str]) -> None:

@@ -115,4 +115,5 @@ Open `http://localhost:5173`; API documentation is available at `http://localhos
 - [Implementation plan](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-poc-implementation-plan.md)
 - [Project blueprint](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-project-blueprint.md)
 - [Technology decisions](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-technology-decisions.md)
+- [Model evaluation and licensing trail](kavia-docs/CodeWiki/Forward-looking/Specs/DetailedDesigns/ppe-compliance-model-evaluation.md)
 - [Operations guide](backend/OPERATIONS.md)

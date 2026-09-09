@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,9 +14,10 @@ from app.audit import record_audit_event
 from app.config import settings
 from app.database import SessionLocal
 from app.decision import DecisionOutcome, SafetyDecisionService
-from app.detection import DetectionOutcome, get_detection_provider
+from app.detection import DetectedObject, DetectionOutcome, get_detection_provider
 from app.evidence import EvidenceService, PrivacyProcessingError
 from app.models import (
+    CameraSource,
     ComplianceAlert,
     EvidenceSnapshot,
     FrameObservation,
@@ -43,10 +45,14 @@ def process_media_job(job_id: str) -> None:
             policy = session.get(ZonePolicy, job.policy_id)
             if policy is None:
                 raise RuntimeError("The job policy is unavailable.")
+            source = session.get(CameraSource, job.source_id)
+            if source is None:
+                raise RuntimeError("The job source is unavailable.")
+            effective_policy = _effective_policy(policy, source)
             media_path = str(Path(settings.private_media_directory) / job.storage_key)
             detections = get_detection_provider(session).evaluate(media_path)
-            decision = SafetyDecisionService().evaluate(detections, policy)
-            _persist_outcome(session, job, policy, detections, decision, media_path)
+            decision = SafetyDecisionService().evaluate(detections, effective_policy)
+            _persist_outcome(session, job, effective_policy, detections, decision, media_path)
             session.commit()
         except Exception:
             job.status = JobStatus.FAILED.value
@@ -64,15 +70,44 @@ def process_media_job(job_id: str) -> None:
             session.commit()
 
 
+def _effective_policy(policy: ZonePolicy, source: CameraSource) -> SimpleNamespace:
+    """Resolve one job's effective policy view (FR-DET-05).
+
+    A source's ``confidence_threshold_override``, when set, replaces the zone policy's flat
+    ``confidence_threshold`` for jobs from that source only. Per-class overrides always come
+    from the zone policy's ``class_confidence_thresholds_json``. The immutable policy row
+    itself is never mutated; this returns a read-only view carrying every attribute decision
+    logic and persistence need.
+    """
+    return SimpleNamespace(
+        id=policy.id,
+        helmet_required=policy.helmet_required,
+        vest_required=policy.vest_required,
+        confidence_threshold=(
+            source.confidence_threshold_override
+            if source.confidence_threshold_override is not None
+            else policy.confidence_threshold
+        ),
+        class_confidence_thresholds=json.loads(policy.class_confidence_thresholds_json or "{}"),
+        persistence_frames=policy.persistence_frames,
+        deduplication_seconds=policy.deduplication_seconds,
+        evidence_retention_hours=policy.evidence_retention_hours,
+    )
+
+
 def _persist_outcome(
     session: Session,
     job: MediaJob,
-    policy: ZonePolicy,
+    policy: SimpleNamespace,
     detections: DetectionOutcome,
     decision: DecisionOutcome,
     media_path: str,
 ) -> None:
-    """Persist aggregate results and create or update a policy-deduplicated alert."""
+    """Persist aggregate results and create or update a policy-deduplicated alert.
+
+    ``policy`` here is the source-resolved effective policy view from ``_effective_policy``,
+    not the raw ``ZonePolicy`` row.
+    """
     now = datetime.now(UTC)
     job.compliant_count = decision.compliant_count
     job.non_compliant_count = decision.non_compliant_count
@@ -208,7 +243,7 @@ def _persist_outcome(
 def _persist_frame_observations(
     session: Session,
     job: MediaJob,
-    policy: ZonePolicy,
+    policy: SimpleNamespace,
     detections: DetectionOutcome,
 ) -> None:
     """Store one non-identifying frame summary and per-person state for each sampled frame, once.
@@ -231,7 +266,6 @@ def _persist_frame_observations(
         compliant = sum(1 for state in person_states if state.compliant is True)
         non_compliant = sum(1 for state in person_states if state.compliant is False)
         unknown = sum(1 for state in person_states if state.compliant is None)
-        confidences = tuple(state.confidence for state in person_states if state.compliant is False)
         session.add(
             FrameObservation(
                 job_id=job.id,
@@ -240,12 +274,7 @@ def _persist_frame_observations(
                 compliant_count=compliant,
                 non_compliant_count=non_compliant,
                 unknown_count=unknown,
-                confidence_summary=json.dumps(
-                    {
-                        "minimum_failure_confidence": round(min(confidences), 3) if confidences else None,
-                        "maximum_failure_confidence": round(max(confidences), 3) if confidences else None,
-                    }
-                ),
+                confidence_summary=json.dumps(_class_confidence_summary(frame.objects)),
                 expires_at=expires_at,
             )
         )
@@ -261,6 +290,27 @@ def _persist_frame_observations(
                     expires_at=expires_at,
                 )
             )
+
+
+def _class_confidence_summary(objects: tuple[DetectedObject, ...]) -> dict[str, dict[str, float | int]]:
+    """Aggregate per-class detection counts and confidence ranges for one frame (FR-DET-03).
+
+    Every normalized label is included, not only compliance-relevant ones: an
+    ``unknown_label`` or ``gloves``/``glasses`` detection is preserved here for benchmark
+    and evaluation review even though decision.py never acts on it (FR-DET-04). Only
+    aggregate counts and confidence ranges are stored — no box geometry or per-object data.
+    """
+    buckets: dict[str, list[float]] = {}
+    for item in objects:
+        buckets.setdefault(item.label, []).append(item.confidence)
+    return {
+        label: {
+            "count": len(confidences),
+            "min_confidence": round(min(confidences), 3),
+            "max_confidence": round(max(confidences), 3),
+        }
+        for label, confidences in buckets.items()
+    }
 
 
 def _person_state_label(compliant: bool | None) -> str:

@@ -60,7 +60,14 @@ class Zone(Base):
 
 
 class ZonePolicy(Base):
-    """An immutable policy version governing PPE evaluation for a zone."""
+    """An immutable policy version governing PPE evaluation for a zone.
+
+    ``class_confidence_thresholds_json`` is an optional JSON object mapping a normalized
+    label (e.g. ``"helmet"``, ``"no_helmet"``, ``"vest"``) to a per-class confidence override,
+    e.g. ``{"no_helmet": 0.4}``. A label absent from the map falls back to
+    ``confidence_threshold`` (FR-DET-05); this and ``confidence_threshold`` are configurable
+    through the API without a code deploy.
+    """
 
     __tablename__ = "zone_policies"
 
@@ -70,6 +77,7 @@ class ZonePolicy(Base):
     helmet_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     vest_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     confidence_threshold: Mapped[float] = mapped_column(Float, default=0.25, nullable=False)
+    class_confidence_thresholds_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     persistence_frames: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     deduplication_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
     evidence_retention_hours: Mapped[int] = mapped_column(Integer, default=48, nullable=False)
@@ -78,7 +86,13 @@ class ZonePolicy(Base):
 
 
 class CameraSource(Base):
-    """A manually selected POC media source linked to a safety zone."""
+    """A manually selected POC media source linked to a safety zone.
+
+    ``confidence_threshold_override``, when set, replaces the active zone policy's
+    ``confidence_threshold`` for jobs from this source only (FR-DET-05) — for example, a
+    higher-mounted or lower-quality camera that needs a stricter threshold than its zone's
+    other sources. Per-class overrides still come from the zone policy either way.
+    """
 
     __tablename__ = "camera_sources"
 
@@ -86,6 +100,7 @@ class CameraSource(Base):
     name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     zone_id: Mapped[str] = mapped_column(ForeignKey("zones.id"), nullable=False, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    confidence_threshold_override: Mapped[float | None] = mapped_column(Float)
 
 
 class MediaJob(Base):

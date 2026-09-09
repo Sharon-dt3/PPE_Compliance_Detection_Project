@@ -104,7 +104,7 @@ type FrameSummary = {
   compliant_count: number;
   non_compliant_count: number;
   unknown_count: number;
-  confidence_summary: Record<string, number | null>;
+  confidence_summary: Record<string, { count: number; min_confidence: number; max_confidence: number }>;
 };
 
 type ModelEvaluation = {

@@ -10,7 +10,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,8 @@ class PolicyResponse(BaseModel):
     version: int
     helmet_required: bool
     vest_required: bool
+    confidence_threshold: float
+    class_confidence_thresholds: dict[str, float]
     persistence_frames: int
     deduplication_seconds: int
 
@@ -65,6 +67,7 @@ class SourceResponse(BaseModel):
     id: str
     name: str
     zone_id: str
+    confidence_threshold_override: float | None
 
 
 class ZoneRequest(BaseModel):
@@ -81,6 +84,9 @@ class SourceRequest(BaseModel):
     name: str = Field(min_length=3, max_length=120)
     zone_id: str = Field(min_length=1, max_length=36)
     enabled: bool = True
+    confidence_threshold_override: float | None = Field(
+        default=None, ge=0, le=1, description="Replaces the zone policy's flat threshold for this source only (FR-DET-05)."
+    )
 
 
 class SourceUpdateRequest(BaseModel):
@@ -89,6 +95,10 @@ class SourceUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=3, max_length=120)
     zone_id: str | None = Field(default=None, min_length=1, max_length=36)
     enabled: bool | None = None
+    confidence_threshold_override: float | None = Field(default=None, ge=0, le=1)
+    clear_confidence_threshold_override: bool = Field(
+        default=False, description="Set true to remove a previously configured override and fall back to the zone policy."
+    )
 
 
 class PolicyRequest(BaseModel):
@@ -97,10 +107,26 @@ class PolicyRequest(BaseModel):
     helmet_required: bool = True
     vest_required: bool = True
     confidence_threshold: float = Field(default=0.25, ge=0, le=1)
+    class_confidence_thresholds: dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional per-label override, e.g. {\"no_helmet\": 0.4}; a label not listed uses confidence_threshold (FR-DET-05).",
+    )
     persistence_frames: int = Field(default=3, ge=1, le=60)
     deduplication_seconds: int = Field(default=60, ge=0, le=86_400)
     evidence_retention_hours: int = Field(default=48, ge=24, le=72)
     active: bool = True
+
+    @field_validator("class_confidence_thresholds")
+    @classmethod
+    def _validate_class_thresholds(cls, value: dict[str, float]) -> dict[str, float]:
+        """Reject unsupported labels and out-of-range thresholds before they reach storage."""
+        allowed_labels = {"person", "helmet", "no_helmet", "vest", "no_vest", "gloves", "glasses"}
+        for label, threshold in value.items():
+            if label not in allowed_labels:
+                raise ValueError(f"Unsupported PPE label '{label}'.")
+            if not 0 <= threshold <= 1:
+                raise ValueError(f"Threshold for '{label}' must be between 0 and 1.")
+        return value
 
 
 class FrameObservationResponse(BaseModel):
@@ -111,7 +137,7 @@ class FrameObservationResponse(BaseModel):
     compliant_count: int
     non_compliant_count: int
     unknown_count: int
-    confidence_summary: dict[str, float | None]
+    confidence_summary: dict[str, dict[str, float]]
 
 
 class MediaJobResponse(BaseModel):
@@ -563,20 +589,7 @@ def list_zones(
     for zone in zones:
         policy = session.scalar(select(ZonePolicy).where(ZonePolicy.zone_id == zone.id, ZonePolicy.active.is_(True)))
         if policy is not None:
-            results.append(
-                ZoneResponse(
-                    id=zone.id,
-                    name=zone.name,
-                    description=zone.description,
-                    policy=PolicyResponse(
-                        version=policy.version,
-                        helmet_required=policy.helmet_required,
-                        vest_required=policy.vest_required,
-                        persistence_frames=policy.persistence_frames,
-                        deduplication_seconds=policy.deduplication_seconds,
-                    ),
-                )
-            )
+            results.append(_zone_response(zone, policy))
     return results
 
 
@@ -614,7 +627,10 @@ def list_sources(
 ) -> list[SourceResponse]:
     """Return enabled manually selectable sources for private POC media submission."""
     sources = session.scalars(select(CameraSource).where(CameraSource.enabled.is_(True)).order_by(CameraSource.name)).all()
-    return [SourceResponse(id=item.id, name=item.name, zone_id=item.zone_id) for item in sources]
+    return [
+        SourceResponse(id=item.id, name=item.name, zone_id=item.zone_id, confidence_threshold_override=item.confidence_threshold_override)
+        for item in sources
+    ]
 
 
 @app.post(
@@ -640,7 +656,10 @@ def create_source(
     session.flush()
     record_actor_audit_event(session, "configuration.source_created", "camera_source", source.id, actor, "Camera source created.")
     session.commit()
-    return SourceResponse(id=source.id, name=source.name, zone_id=source.zone_id)
+    return SourceResponse(
+        id=source.id, name=source.name, zone_id=source.zone_id,
+        confidence_threshold_override=source.confidence_threshold_override,
+    )
 
 
 @app.get("/api/v1/sources/{source_id}", response_model=SourceResponse, tags=["Configuration"], summary="Get camera source configuration")
@@ -654,7 +673,10 @@ def get_source(
     source = session.get(CameraSource, source_id)
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured camera source not found.")
-    return SourceResponse(id=source.id, name=source.name, zone_id=source.zone_id)
+    return SourceResponse(
+        id=source.id, name=source.name, zone_id=source.zone_id,
+        confidence_threshold_override=source.confidence_threshold_override,
+    )
 
 
 @app.patch("/api/v1/sources/{source_id}", response_model=SourceResponse, tags=["Configuration"], summary="Update a camera source")
@@ -669,7 +691,9 @@ def update_source(
     source = session.get(CameraSource, source_id)
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured camera source not found.")
-    changes = request.model_dump(exclude_none=True)
+    changes = request.model_dump(exclude_none=True, exclude={"clear_confidence_threshold_override"})
+    if request.clear_confidence_threshold_override:
+        changes["confidence_threshold_override"] = None
     if not changes:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one source property must be supplied.")
     if "zone_id" in changes and session.get(Zone, changes["zone_id"]) is None:
@@ -681,7 +705,10 @@ def update_source(
         setattr(source, field, value)
     record_actor_audit_event(session, "configuration.source_updated", "camera_source", source.id, actor, "Camera source configuration changed.")
     session.commit()
-    return SourceResponse(id=source.id, name=source.name, zone_id=source.zone_id)
+    return SourceResponse(
+        id=source.id, name=source.name, zone_id=source.zone_id,
+        confidence_threshold_override=source.confidence_threshold_override,
+    )
 
 
 @app.patch("/api/v1/zones/{zone_id}/policy", response_model=PolicyResponse, tags=["Configuration"], summary="Create and activate a zone policy version")
@@ -699,7 +726,12 @@ def create_zone_policy_version(
     if request.active:
         for policy in session.scalars(select(ZonePolicy).where(ZonePolicy.zone_id == zone_id, ZonePolicy.active.is_(True))).all():
             policy.active = False
-    policy = ZonePolicy(zone_id=zone_id, version=int(latest_version) + 1, **request.model_dump())
+    policy = ZonePolicy(
+        zone_id=zone_id,
+        version=int(latest_version) + 1,
+        class_confidence_thresholds_json=json.dumps(request.class_confidence_thresholds),
+        **request.model_dump(exclude={"class_confidence_thresholds"}),
+    )
     session.add(policy)
     session.flush()
     record_actor_audit_event(session, "configuration.policy_version_created", "zone_policy", policy.id, actor, "Versioned PPE policy created.")
@@ -1136,6 +1168,8 @@ def _policy_response(policy: ZonePolicy) -> PolicyResponse:
         version=policy.version,
         helmet_required=policy.helmet_required,
         vest_required=policy.vest_required,
+        confidence_threshold=policy.confidence_threshold,
+        class_confidence_thresholds=json.loads(policy.class_confidence_thresholds_json or "{}"),
         persistence_frames=policy.persistence_frames,
         deduplication_seconds=policy.deduplication_seconds,
     )

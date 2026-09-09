@@ -85,6 +85,10 @@ class DemoDetectionProvider:
 class UltralyticsPpeProvider:
     """Run an explicitly configured YOLO PPE model against private media."""
 
+    # Normalizes every supported provider's raw class names to the application's shared
+    # label set (FR-DET-02). A raw label with no entry here becomes "unknown_label" rather
+    # than being silently dropped (FR-DET-04): it stays visible for benchmark/evaluation
+    # review, while the compliance rules in decision.py simply never look for that label.
     _LABELS = {
         "human": "person",
         "person": "person",
@@ -97,9 +101,18 @@ class UltralyticsPpeProvider:
         "no hardhat": "no_helmet",
         "vest": "vest",
         "safety vest": "vest",
+        "safety-vest": "vest",
         "no-vest": "no_vest",
         "no vest": "no_vest",
+        "no-safety-vest": "no_vest",
+        "glove": "gloves",
+        "gloves": "gloves",
+        "glass": "glasses",
+        "glasses": "glasses",
+        "goggle": "glasses",
+        "goggles": "glasses",
     }
+    _UNKNOWN_LABEL = "unknown_label"
 
     def __init__(
         self,

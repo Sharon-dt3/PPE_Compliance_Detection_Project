@@ -159,8 +159,16 @@ class SafetyDecisionService:
 
     @staticmethod
     def _accepted(item: DetectedObject, policy: ZonePolicy) -> bool:
-        """Reject detector evidence below the active policy confidence threshold."""
-        return item.confidence >= policy.confidence_threshold
+        """Reject detector evidence below the effective per-class or policy confidence threshold.
+
+        ``class_confidence_thresholds`` (FR-DET-05), when present on the supplied policy view,
+        overrides the flat ``confidence_threshold`` for one normalized label. It is looked up
+        with a plain ``getattr`` so a bare ``ZonePolicy`` row or a test fixture without the
+        attribute still falls back to the flat threshold unchanged.
+        """
+        overrides: dict[str, float] = getattr(policy, "class_confidence_thresholds", None) or {}
+        threshold = overrides.get(item.label, policy.confidence_threshold)
+        return item.confidence >= threshold
 
     @staticmethod
     def _is_associated(person: BoundingBox, ppe: BoundingBox) -> bool:
