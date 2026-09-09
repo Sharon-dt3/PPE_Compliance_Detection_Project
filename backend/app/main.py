@@ -18,7 +18,6 @@ from app.audit import record_actor_audit_event
 from app.auth import AuthenticatedActor, Role, require_role
 from app.config import settings
 from app.database import get_session, initialise_database
-from app.evidence import EvidenceService
 from app.media_validation import validate_media_upload, validate_video_file
 from app.models import (
     AuditEvent,
@@ -663,8 +662,10 @@ def get_alert_evidence(
     if snapshot is None or not snapshot.blurred or snapshot.deleted_at is not None or snapshot.expires_at <= datetime.now(UTC):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Privacy-processed evidence is unavailable or expired.")
     try:
+        from app.evidence import EvidenceService
+
         content = EvidenceService().read(snapshot.storage_key)
-    except FileNotFoundError as error:
+    except (FileNotFoundError, ImportError) as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Privacy-processed evidence is unavailable.") from error
 
     record_actor_audit_event(session, "evidence.accessed", "evidence_snapshot", snapshot.id, actor, "Face-blurred evidence viewed.")

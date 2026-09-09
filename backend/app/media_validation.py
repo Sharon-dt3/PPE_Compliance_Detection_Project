@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
 import numpy as np
 from fastapi import HTTPException, status
 
@@ -47,6 +46,11 @@ def validate_media_upload(filename: str, content_type: str | None, content: byte
 
 def validate_video_file(path: str) -> None:
     """Validate video dimensions and duration after the private upload has been saved."""
+    try:
+        import cv2
+    except ImportError as error:
+        raise ValueError("Video validation is unavailable because its approved decoder is not installed.") from error
+
     capture = cv2.VideoCapture(path)
     try:
         if not capture.isOpened():
@@ -70,6 +74,14 @@ def _validate_image(content: bytes, media_kind: str) -> None:
     is_png = content.startswith(b"\x89PNG\r\n\x1a\n")
     if (media_kind == "jpeg" and not is_jpeg) or (media_kind == "png" and not is_png):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The file content does not match its declared image format.")
+
+    try:
+        import cv2
+    except ImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Image validation is unavailable because its approved decoder is not installed.",
+        ) from error
 
     image = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
