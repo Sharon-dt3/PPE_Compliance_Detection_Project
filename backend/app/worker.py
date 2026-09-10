@@ -1,8 +1,11 @@
 """Celery worker configuration for private-media processing and retention."""
 
+import uuid
+
 from celery import Celery
 
 from app.config import settings
+from app.logging_config import set_correlation_id
 from app.retention import remove_expired_private_data
 
 celery_app = Celery("ppe_compliance", broker=settings.redis_url, backend=settings.redis_url)
@@ -31,4 +34,8 @@ def process_media_job_task(job_id: str) -> None:
 @celery_app.task(name="ppe.remove_expired_private_data")
 def remove_expired_private_data_task() -> dict[str, object]:
     """Delete expired private data and return JSON-safe retention monitoring data."""
-    return remove_expired_private_data().as_monitoring_payload()
+    set_correlation_id(f"retention-{uuid.uuid4()}")
+    try:
+        return remove_expired_private_data().as_monitoring_payload()
+    finally:
+        set_correlation_id(None)

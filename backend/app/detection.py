@@ -58,15 +58,24 @@ class DetectionOutcome:
 class DetectionProvider(Protocol):
     """Contract implemented by real and controlled-demo PPE inference providers."""
 
-    def evaluate(self, media_path: str) -> DetectionOutcome:
-        """Evaluate private media and return frame-level detector observations."""
+    def evaluate(self, media_path: str, *, sampling_fps: float | None = None) -> DetectionOutcome:
+        """Evaluate private media and return frame-level detector observations.
+
+        ``sampling_fps``, when given, is the zone policy's configured target detector
+        sampling rate for a video source (FR-ING/Blueprint "video sampling rate"); it has no
+        meaningful effect on a still image and a provider may ignore it if inapplicable.
+        """
 
 
 class DemoDetectionProvider:
     """Deterministic provider for explicit workflow testing only."""
 
-    def evaluate(self, media_path: str) -> DetectionOutcome:
-        """Return three persistent explicit helmet failures for workflow testing."""
+    def evaluate(self, media_path: str, *, sampling_fps: float | None = None) -> DetectionOutcome:
+        """Return three persistent explicit helmet failures for workflow testing.
+
+        ``sampling_fps`` is accepted for interface compatibility and has no effect: this
+        provider's output is fixed and never reads the media file.
+        """
         person = BoundingBox(0.25, 0.15, 0.75, 0.95)
         no_helmet = BoundingBox(0.35, 0.16, 0.65, 0.38)
         frames = tuple(
@@ -128,14 +137,19 @@ class UltralyticsPpeProvider:
         self._local_model_path = local_model_path
         self._confidence_threshold = confidence_threshold
 
-    def evaluate(self, media_path: str) -> DetectionOutcome:
-        """Run YOLO and return labeled boxes without assigning any persistent identity."""
+    def evaluate(self, media_path: str, *, sampling_fps: float | None = None) -> DetectionOutcome:
+        """Run YOLO and return labeled boxes without assigning any persistent identity.
+
+        ``sampling_fps`` (the active zone policy's configured target rate) is translated
+        into an Ultralytics video frame stride; it has no effect on a still image.
+        """
         model = self._load_model()
         results = model.predict(
             source=media_path,
             conf=self._confidence_threshold,
             verbose=False,
             stream=False,
+            vid_stride=self._resolve_vid_stride(media_path, sampling_fps),
         )
         frames: list[FrameDetections] = []
 
@@ -143,9 +157,7 @@ class UltralyticsPpeProvider:
             objects: list[DetectedObject] = []
             names = result.names
             for box in result.boxes:
-                label = self._LABELS.get(str(names[int(box.cls[0])]).lower())
-                if label is None:
-                    continue
+                label = self._LABELS.get(str(names[int(box.cls[0])]).lower(), self._UNKNOWN_LABEL)
                 coordinates = [float(value) for value in box.xyxy[0].tolist()]
                 objects.append(
                     DetectedObject(
@@ -183,6 +195,31 @@ class UltralyticsPpeProvider:
                 hf_hub_download(repo_id=self._hf_model_repository, filename=self._hf_model_filename)
             )
         return YOLO(str(model_path))
+
+    @staticmethod
+    def _resolve_vid_stride(media_path: str, sampling_fps: float | None) -> int:
+        """Translate a target sampling rate into an Ultralytics video frame stride.
+
+        Falls back to processing every frame (stride 1) when no target is configured, the
+        source's native frame rate cannot be read (missing file, unsupported codec, or a
+        still image), or the OpenCV dependency is unavailable -- a sampling-rate preference
+        must never fail a job outright.
+        """
+        if not sampling_fps or sampling_fps <= 0:
+            return 1
+        try:
+            import cv2
+        except ImportError:
+            return 1
+
+        capture = cv2.VideoCapture(media_path)
+        try:
+            native_fps = capture.get(cv2.CAP_PROP_FPS)
+        finally:
+            capture.release()
+        if not native_fps or native_fps <= 0:
+            return 1
+        return max(1, round(native_fps / sampling_fps))
 
 
 def get_detection_provider(session: Session) -> DetectionProvider:

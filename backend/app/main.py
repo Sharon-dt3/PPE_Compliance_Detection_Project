@@ -5,11 +5,14 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -18,12 +21,15 @@ from app.audit import record_actor_audit_event
 from app.auth import AuthenticatedActor, Role, current_actor, require_role
 from app.config import settings
 from app.database import get_session, initialise_database
+from app.logging_config import configure_logging, set_correlation_id
 from app.media_validation import validate_media_upload, validate_video_file
 from app.models import (
     ApplicationUser,
     AuditEvent,
     CameraSource,
     ComplianceAlert,
+    EventAcknowledgement,
+    EventRuleResult,
     EvidenceSnapshot,
     FrameObservation,
     JobStatus,
@@ -39,6 +45,8 @@ from app.reporting import AggregateReportingService, ReportFilters
 from app.storage import PrivateMediaStorage
 from app.worker import process_media_job_task
 
+logger = logging.getLogger(__name__)
+
 
 class PolicyResponse(BaseModel):
     """Public representation of one active zone policy."""
@@ -50,6 +58,7 @@ class PolicyResponse(BaseModel):
     class_confidence_thresholds: dict[str, float]
     persistence_frames: int
     deduplication_seconds: int
+    sampling_fps: float | None
 
 
 class ZoneResponse(BaseModel):
@@ -114,6 +123,9 @@ class PolicyRequest(BaseModel):
     persistence_frames: int = Field(default=3, ge=1, le=60)
     deduplication_seconds: int = Field(default=60, ge=0, le=86_400)
     evidence_retention_hours: int = Field(default=48, ge=24, le=72)
+    sampling_fps: float | None = Field(
+        default=None, gt=0, le=30, description="Target detector sampling rate for video sources, e.g. 2-5 FPS; unset processes every frame."
+    )
     active: bool = True
 
     @field_validator("class_confidence_thresholds")
@@ -180,6 +192,28 @@ class AlertResponse(BaseModel):
     resolution_note: str | None
     evidence_available: bool
     evidence_message: str
+
+
+class RuleResultResponse(BaseModel):
+    """One durable, explainable rule-evaluation record behind an alert."""
+
+    id: str
+    requirement: str
+    persistent: bool
+    non_compliant_count: int
+    confidence: float | None
+    created_at: datetime
+
+
+class AcknowledgementResponse(BaseModel):
+    """One append-only human-review action taken on an alert."""
+
+    id: str
+    actor_role: str
+    prior_status: str
+    next_status: str
+    note: str
+    created_at: datetime
 
 
 class ComplianceReport(BaseModel):
@@ -364,12 +398,48 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Authorization", "Content-Type", "X-Demo-Role"],
+    expose_headers=["X-Request-Id"],
 )
+
+
+@app.middleware("http")
+async def correlate_request(request: Request, call_next):
+    """Attach one correlation id to every request, its logs, and its response header.
+
+    Reuses an incoming ``X-Request-Id`` when a caller already has one (e.g. propagated from
+    an upstream gateway); otherwise generates one. This is the shared mechanism behind
+    Phase 1's "correlation/request IDs in responses and logs" requirement -- every log line
+    emitted while handling this request carries the same id via ``logging_config``.
+
+    Deliberately does not reset the correlation id back to ``None`` before returning: the
+    response is only streamed to the client, and uvicorn's own access-log line written,
+    after this coroutine returns, so resetting here would blank the id from that final log
+    line. Each request runs in its own asyncio task, so leaving it set does not leak the id
+    into a sibling request.
+    """
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    set_correlation_id(request_id)
+    response = await call_next(request)
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """Return a safe, generic 5xx body for any error not already an HTTPException.
+
+    Completes the status-code contract as shared middleware: callers always receive a
+    consistent JSON error shape, and the real exception (never raw media, storage paths, or
+    credentials) is logged server-side against the request's correlation id only.
+    """
+    logger.exception("Unhandled error while processing a request.")
+    return JSONResponse(status_code=500, content={"detail": "An unexpected error occurred. Please try again or contact support."})
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    """Initialise the local schema and fixed POC configuration before accepting requests."""
+    """Configure structured logging, then initialise the schema before accepting requests."""
+    configure_logging()
     initialise_database()
 
 
@@ -914,9 +984,11 @@ def acknowledge_alert(
     alert = _get_alert_or_404(session, alert_id)
     if alert.status != "open":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only open alerts may be acknowledged.")
+    prior_status = alert.status
     alert.status = "acknowledged"
     alert.acknowledged_at = datetime.now(UTC)
     alert.acknowledgement_note = request.note
+    _record_acknowledgement(session, alert, actor, prior_status, request.note)
     record_actor_audit_event(session, "alert.acknowledged", "compliance_alert", alert.id, actor, "Safety intervention recorded.")
     session.commit()
     session.refresh(alert)
@@ -935,13 +1007,75 @@ def resolve_alert(
     alert = _get_alert_or_404(session, alert_id)
     if alert.status not in {"open", "acknowledged"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only active alerts may be resolved.")
+    prior_status = alert.status
     alert.status = "resolved"
     alert.resolved_at = datetime.now(UTC)
     alert.resolution_note = request.note
+    _record_acknowledgement(session, alert, actor, prior_status, request.note)
     record_actor_audit_event(session, "alert.resolved", "compliance_alert", alert.id, actor, "Supervisor-reviewed safety event resolved.")
     session.commit()
     session.refresh(alert)
     return _alert_response(alert)
+
+
+@app.get(
+    "/api/v1/alerts/{alert_id}/rule-results",
+    response_model=list[RuleResultResponse],
+    tags=["Alerts"],
+    summary="Get the explainable rule results behind an alert",
+)
+# PUBLIC_INTERFACE
+def list_alert_rule_results(
+    alert_id: str,
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER)),
+) -> list[RuleResultResponse]:
+    """Return every durable rule-evaluation record behind one alert, oldest first."""
+    _get_alert_or_404(session, alert_id)
+    results = session.scalars(
+        select(EventRuleResult).where(EventRuleResult.alert_id == alert_id).order_by(EventRuleResult.created_at)
+    ).all()
+    return [
+        RuleResultResponse(
+            id=item.id,
+            requirement=item.requirement,
+            persistent=item.persistent,
+            non_compliant_count=item.non_compliant_count,
+            confidence=item.confidence,
+            created_at=item.created_at,
+        )
+        for item in results
+    ]
+
+
+@app.get(
+    "/api/v1/alerts/{alert_id}/acknowledgements",
+    response_model=list[AcknowledgementResponse],
+    tags=["Alerts"],
+    summary="Get the full acknowledgement/resolution history for an alert",
+)
+# PUBLIC_INTERFACE
+def list_alert_acknowledgements(
+    alert_id: str,
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER)),
+) -> list[AcknowledgementResponse]:
+    """Return every human-review action on one alert, oldest first -- not only the latest."""
+    _get_alert_or_404(session, alert_id)
+    results = session.scalars(
+        select(EventAcknowledgement).where(EventAcknowledgement.alert_id == alert_id).order_by(EventAcknowledgement.created_at)
+    ).all()
+    return [
+        AcknowledgementResponse(
+            id=item.id,
+            actor_role=item.actor_role,
+            prior_status=item.prior_status,
+            next_status=item.next_status,
+            note=item.note,
+            created_at=item.created_at,
+        )
+        for item in results
+    ]
 
 
 @app.post(
@@ -1172,6 +1306,7 @@ def _policy_response(policy: ZonePolicy) -> PolicyResponse:
         class_confidence_thresholds=json.loads(policy.class_confidence_thresholds_json or "{}"),
         persistence_frames=policy.persistence_frames,
         deduplication_seconds=policy.deduplication_seconds,
+        sampling_fps=policy.sampling_fps,
     )
 
 
@@ -1237,6 +1372,32 @@ def _job_response(job: MediaJob) -> MediaJobResponse:
         unknown_count=job.unknown_count,
         message=job.message,
         failure_code=job.failure_code,
+    )
+
+
+def _record_acknowledgement(
+    session: Session,
+    alert: ComplianceAlert,
+    actor: AuthenticatedActor,
+    prior_status: str,
+    note: str,
+) -> None:
+    """Append one human-review action to the alert's full acknowledgement history.
+
+    Distinct from the audit log and from the latest-note fields still kept on the alert
+    itself for quick display: this is the durable, queryable "timestamp, operator
+    reference, prior state, next state, note" record for every action, not only the most
+    recent one.
+    """
+    session.add(
+        EventAcknowledgement(
+            alert_id=alert.id,
+            actor_reference=actor.reference,
+            actor_role=actor.role.value,
+            prior_status=prior_status,
+            next_status=alert.status,
+            note=note,
+        )
     )
 
 

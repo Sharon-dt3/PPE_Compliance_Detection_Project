@@ -30,6 +30,9 @@ def apply_migrations(connection: Connection) -> None:
         ("20260909_platform_settings", _upgrade_platform_settings),
         ("20260909_evidence_demo_approved", _upgrade_evidence_demo_approved),
         ("20260909_class_and_source_thresholds", _upgrade_class_and_source_thresholds),
+        ("20260910_sampling_fps", _upgrade_sampling_fps),
+        ("20260910_event_rule_results", _upgrade_event_rule_results),
+        ("20260910_event_acknowledgements", _upgrade_event_acknowledgements),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -192,6 +195,51 @@ def _upgrade_class_and_source_thresholds(connection: Connection) -> None:
     """Add per-class zone-policy and per-source confidence-threshold overrides (FR-DET-05)."""
     _add_missing_columns(connection, "zone_policies", {"class_confidence_thresholds_json": "TEXT DEFAULT '{}' NOT NULL"})
     _add_missing_columns(connection, "camera_sources", {"confidence_threshold_override": "FLOAT"})
+
+
+def _upgrade_sampling_fps(connection: Connection) -> None:
+    """Add the optional per-policy video detector sampling rate."""
+    _add_missing_columns(connection, "zone_policies", {"sampling_fps": "FLOAT"})
+
+
+def _upgrade_event_rule_results(connection: Connection) -> None:
+    """Create the durable, explainable per-requirement rule-evaluation record."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS event_rule_results ("
+            "id VARCHAR(36) PRIMARY KEY, "
+            "alert_id VARCHAR(36) NOT NULL, "
+            "job_id VARCHAR(36) NOT NULL, "
+            "policy_id VARCHAR(36) NOT NULL, "
+            "requirement VARCHAR(120) NOT NULL, "
+            "persistent BOOLEAN NOT NULL, "
+            "non_compliant_count INTEGER NOT NULL, "
+            "confidence FLOAT, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+        )
+    )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_event_rule_results_alert_id ON event_rule_results (alert_id)"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_event_rule_results_job_id ON event_rule_results (job_id)"))
+
+
+def _upgrade_event_acknowledgements(connection: Connection) -> None:
+    """Create the append-only alert acknowledgement/resolution history."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS event_acknowledgements ("
+            "id VARCHAR(36) PRIMARY KEY, "
+            "alert_id VARCHAR(36) NOT NULL, "
+            "actor_reference VARCHAR(128) NOT NULL, "
+            "actor_role VARCHAR(50) NOT NULL, "
+            "prior_status VARCHAR(20) NOT NULL, "
+            "next_status VARCHAR(20) NOT NULL, "
+            "note TEXT NOT NULL, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+        )
+    )
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_event_acknowledgements_alert_id ON event_acknowledgements (alert_id)")
+    )
 
 
 def _add_missing_columns(connection: Connection, table: str, additions: dict[str, str]) -> None:

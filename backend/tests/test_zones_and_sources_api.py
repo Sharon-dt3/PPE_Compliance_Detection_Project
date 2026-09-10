@@ -38,6 +38,7 @@ def test_list_zones_includes_full_policy_shape() -> None:
             "class_confidence_thresholds",
             "persistence_frames",
             "deduplication_seconds",
+            "sampling_fps",
         }
 
 

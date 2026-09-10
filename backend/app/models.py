@@ -67,6 +67,9 @@ class ZonePolicy(Base):
     e.g. ``{"no_helmet": 0.4}``. A label absent from the map falls back to
     ``confidence_threshold`` (FR-DET-05); this and ``confidence_threshold`` are configurable
     through the API without a code deploy.
+
+    ``sampling_fps``, when set, is the target detector sampling rate for video sources
+    (e.g. 2-5 FPS); ``None`` means the provider processes its own native frame rate.
     """
 
     __tablename__ = "zone_policies"
@@ -81,6 +84,7 @@ class ZonePolicy(Base):
     persistence_frames: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     deduplication_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
     evidence_retention_hours: Mapped[int] = mapped_column(Integer, default=48, nullable=False)
+    sampling_fps: Mapped[float | None] = mapped_column(Float)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -151,6 +155,48 @@ class ComplianceAlert(Base):
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution_note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EventRuleResult(Base):
+    """The persisted, explainable rule-evaluation result behind one alert-creating decision.
+
+    Separate from ``ComplianceAlert`` (which holds only the current summary) so that every
+    time a media job's decision touches a requirement -- whether it creates a new alert or
+    merges into an existing one via deduplication -- there is a durable, queryable record
+    of exactly which policy version and rule produced it and why (FR-RULE explainability).
+    """
+
+    __tablename__ = "event_rule_results"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    alert_id: Mapped[str] = mapped_column(ForeignKey("compliance_alerts.id"), nullable=False, index=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("media_jobs.id"), nullable=False, index=True)
+    policy_id: Mapped[str] = mapped_column(ForeignKey("zone_policies.id"), nullable=False)
+    requirement: Mapped[str] = mapped_column(String(120), nullable=False)
+    persistent: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    non_compliant_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EventAcknowledgement(Base):
+    """One append-only human-review action taken on an alert.
+
+    Distinct from the latest-note fields still kept on ``ComplianceAlert`` for quick display:
+    this is the full audited history (every acknowledgement and resolution, not only the most
+    recent), matching "timestamp, operator reference, prior state, next state, note".
+    """
+
+    __tablename__ = "event_acknowledgements"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    alert_id: Mapped[str] = mapped_column(ForeignKey("compliance_alerts.id"), nullable=False, index=True)
+    actor_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_role: Mapped[str] = mapped_column(String(50), nullable=False)
+    prior_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    next_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

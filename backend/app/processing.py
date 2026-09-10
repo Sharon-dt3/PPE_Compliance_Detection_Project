@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -16,10 +18,13 @@ from app.database import SessionLocal
 from app.decision import DecisionOutcome, RequirementDecision, SafetyDecisionService
 from app.detection import DetectedObject, DetectionOutcome, get_detection_provider
 from app.evidence import EvidenceService, PrivacyProcessingError
+from app.logging_config import get_correlation_id, set_correlation_id
 from app.models import (
     CameraSource,
     ComplianceAlert,
     EvidenceSnapshot,
+    EventAcknowledgement,
+    EventRuleResult,
     FrameObservation,
     JobStatus,
     MediaJob,
@@ -29,45 +34,104 @@ from app.models import (
 )
 from app.platform_settings import get_platform_settings
 
+logger = logging.getLogger(__name__)
 
-def process_media_job(job_id: str) -> None:
-    """Process one queued private-media job and persist only non-identifying results."""
-    with SessionLocal() as session:
-        job = session.get(MediaJob, job_id)
+
+class JobRepository(Protocol):
+    """Persistence boundary for media-job lifecycle state transitions.
+
+    ``process_media_job`` depends on this interface rather than inline SQLAlchemy calls for
+    its queued/processing/failed transitions (Phase 3's SOLID goal): the worker's control
+    flow can be exercised against a fake repository, and how a status change is actually
+    written has exactly one place to change. The "completed" transition is intentionally
+    not split out here -- it is one atomic write together with the frame observations,
+    alerts, and metric rollup the same decision produces, in ``_persist_outcome``.
+    """
+
+    def get_processable(self, job_id: str) -> MediaJob | None:
+        """Return the job only if it is still eligible to be processed, else None."""
+
+    def mark_processing(self, job: MediaJob) -> None:
+        """Transition a job to PROCESSING and persist the change immediately."""
+
+    def mark_failed(self, job: MediaJob, message: str) -> None:
+        """Transition a job to FAILED, record its completion time, and audit the failure."""
+
+
+class SqlAlchemyJobRepository:
+    """Default ``JobRepository`` backed directly by the active SQLAlchemy session."""
+
+    def __init__(self, session: Session) -> None:
+        """Bind this repository to the session used for the current job's processing."""
+        self._session = session
+
+    def get_processable(self, job_id: str) -> MediaJob | None:
+        """Return the job only if it is still eligible to be processed, else None."""
+        job = self._session.get(MediaJob, job_id)
         if job is None or job.status not in {JobStatus.QUEUED.value, JobStatus.PROCESSING.value}:
-            return
+            return None
+        return job
 
+    def mark_processing(self, job: MediaJob) -> None:
+        """Transition a job to PROCESSING and persist the change immediately."""
         job.status = JobStatus.PROCESSING.value
         job.message = "Processing private media."
-        session.commit()
+        self._session.commit()
 
-        try:
-            policy = session.get(ZonePolicy, job.policy_id)
-            if policy is None:
-                raise RuntimeError("The job policy is unavailable.")
-            source = session.get(CameraSource, job.source_id)
-            if source is None:
-                raise RuntimeError("The job source is unavailable.")
-            effective_policy = _effective_policy(policy, source)
-            media_path = str(Path(settings.private_media_directory) / job.storage_key)
-            detections = get_detection_provider(session).evaluate(media_path)
-            decision = SafetyDecisionService().evaluate(detections, effective_policy)
-            _persist_outcome(session, job, effective_policy, detections, decision, media_path)
-            session.commit()
-        except Exception:
-            job.status = JobStatus.FAILED.value
-            job.message = "Processing failed safely. Review approved model configuration and retry after correction."
-            job.completed_at = datetime.now(UTC)
-            record_audit_event(
-                session,
-                "media_job.processing_failed",
-                "media_job",
-                job.id,
-                "processing-worker",
-                "system",
-                "Safe processing failure.",
-            )
-            session.commit()
+    def mark_failed(self, job: MediaJob, message: str) -> None:
+        """Transition a job to FAILED, record its completion time, and audit the failure."""
+        job.status = JobStatus.FAILED.value
+        job.message = message
+        job.completed_at = datetime.now(UTC)
+        record_audit_event(
+            self._session,
+            "media_job.processing_failed",
+            "media_job",
+            job.id,
+            "processing-worker",
+            "system",
+            "Safe processing failure.",
+        )
+        self._session.commit()
+
+
+def process_media_job(job_id: str, *, repository_factory: Callable[[Session], JobRepository] = SqlAlchemyJobRepository) -> None:
+    """Process one queued private-media job and persist only non-identifying results."""
+    previous_correlation_id = get_correlation_id()
+    set_correlation_id(job_id)
+    try:
+        with SessionLocal() as session:
+            repository = repository_factory(session)
+            job = repository.get_processable(job_id)
+            if job is None:
+                return
+
+            repository.mark_processing(job)
+            logger.info("Media job processing started.")
+
+            try:
+                policy = session.get(ZonePolicy, job.policy_id)
+                if policy is None:
+                    raise RuntimeError("The job policy is unavailable.")
+                source = session.get(CameraSource, job.source_id)
+                if source is None:
+                    raise RuntimeError("The job source is unavailable.")
+                effective_policy = _effective_policy(policy, source)
+                media_path = str(Path(settings.private_media_directory) / job.storage_key)
+                detections = get_detection_provider(session).evaluate(
+                    media_path, sampling_fps=effective_policy.sampling_fps
+                )
+                decision = SafetyDecisionService().evaluate(detections, effective_policy)
+                _persist_outcome(session, job, effective_policy, detections, decision, media_path)
+                session.commit()
+                logger.info("Media job processing completed.")
+            except Exception:
+                logger.exception("Media job processing failed safely.")
+                repository.mark_failed(
+                    job, "Processing failed safely. Review approved model configuration and retry after correction."
+                )
+    finally:
+        set_correlation_id(previous_correlation_id)
 
 
 def _effective_policy(policy: ZonePolicy, source: CameraSource) -> SimpleNamespace:
@@ -92,6 +156,7 @@ def _effective_policy(policy: ZonePolicy, source: CameraSource) -> SimpleNamespa
         persistence_frames=policy.persistence_frames,
         deduplication_seconds=policy.deduplication_seconds,
         evidence_retention_hours=policy.evidence_retention_hours,
+        sampling_fps=policy.sampling_fps,
     )
 
 
@@ -152,6 +217,32 @@ def _persist_outcome(
         _create_or_update_alert(session, job, policy, detections, media_path, requirement_decision, now)
 
 
+def _record_rule_result(
+    session: Session,
+    alert: ComplianceAlert,
+    job: MediaJob,
+    policy: SimpleNamespace,
+    requirement_decision: RequirementDecision,
+) -> None:
+    """Persist the durable, explainable rule-evaluation record behind one alert touch.
+
+    Written every time a decision reaches or reinforces a persistent requirement, whether
+    that creates a new alert or merges into an existing one -- a queryable history of every
+    policy version and rule that produced this alert, separate from its current summary.
+    """
+    session.add(
+        EventRuleResult(
+            alert_id=alert.id,
+            job_id=job.id,
+            policy_id=policy.id,
+            requirement=requirement_decision.requirement,
+            persistent=requirement_decision.persistent,
+            non_compliant_count=requirement_decision.non_compliant_count,
+            confidence=requirement_decision.confidence,
+        )
+    )
+
+
 def _create_or_update_alert(
     session: Session,
     job: MediaJob,
@@ -177,6 +268,7 @@ def _create_or_update_alert(
         alert.last_observed_at = now
         alert.occurrence_count += 1
         alert.confidence = max(alert.confidence, requirement_decision.confidence or 0)
+        _record_rule_result(session, alert, job, policy, requirement_decision)
         record_audit_event(
             session,
             "alert.deduplicated",
@@ -203,6 +295,7 @@ def _create_or_update_alert(
     )
     session.add(alert)
     session.flush()
+    _record_rule_result(session, alert, job, policy, requirement_decision)
     record_audit_event(
         session,
         "alert.created",

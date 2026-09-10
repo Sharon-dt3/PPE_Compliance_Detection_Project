@@ -50,7 +50,7 @@ def _seed_zones_sources_and_policies(session: Session) -> None:
 
     session.add_all(
         [
-            ZonePolicy(zone_id=yard.id, version=1, helmet_required=True, vest_required=True),
+            ZonePolicy(zone_id=yard.id, version=1, helmet_required=True, vest_required=True, sampling_fps=3.0),
             ZonePolicy(zone_id=sorting.id, version=1, helmet_required=False, vest_required=True),
             ZonePolicy(zone_id=walkway.id, version=1, helmet_required=False, vest_required=False),
         ]
