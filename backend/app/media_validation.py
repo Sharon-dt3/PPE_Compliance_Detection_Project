@@ -66,6 +66,8 @@ def validate_video_file(path: str) -> None:
         raise ValueError("The video dimensions exceed the approved limit.")
     if fps <= 0 or frame_count < 0 or frame_count / fps > settings.max_video_duration_seconds:
         raise ValueError("The video duration exceeds the approved limit.")
+    if fps > settings.max_video_fps:
+        raise ValueError("The video frame rate exceeds the approved maximum FPS limit.")
 
 
 def _validate_image(content: bytes, media_kind: str) -> None:

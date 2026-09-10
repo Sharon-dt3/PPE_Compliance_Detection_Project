@@ -33,6 +33,8 @@ def apply_migrations(connection: Connection) -> None:
         ("20260910_sampling_fps", _upgrade_sampling_fps),
         ("20260910_event_rule_results", _upgrade_event_rule_results),
         ("20260910_event_acknowledgements", _upgrade_event_acknowledgements),
+        ("20260910_policy_effective_window", _upgrade_policy_effective_window),
+        ("20260910_test_media_retention", _upgrade_test_media_retention),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -239,6 +241,23 @@ def _upgrade_event_acknowledgements(connection: Connection) -> None:
     )
     connection.execute(
         text("CREATE INDEX IF NOT EXISTS ix_event_acknowledgements_alert_id ON event_acknowledgements (alert_id)")
+    )
+
+
+def _upgrade_policy_effective_window(connection: Connection) -> None:
+    """Add optional policy effective start/end timestamps for time-scoped policy versions."""
+    _add_missing_columns(connection, "zone_policies", {"effective_start": "TIMESTAMP", "effective_end": "TIMESTAMP"})
+
+
+def _upgrade_test_media_retention(connection: Connection) -> None:
+    """Add the administrator-approved test-media retention workflow flags to media jobs."""
+    _add_missing_columns(
+        connection,
+        "media_jobs",
+        {
+            "is_test_media": "BOOLEAN DEFAULT 0 NOT NULL",
+            "test_retention_approved": "BOOLEAN DEFAULT 0 NOT NULL",
+        },
     )
 
 

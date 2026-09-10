@@ -85,6 +85,8 @@ class ZonePolicy(Base):
     deduplication_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
     evidence_retention_hours: Mapped[int] = mapped_column(Integer, default=48, nullable=False)
     sampling_fps: Mapped[float | None] = mapped_column(Float)
+    effective_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    effective_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -127,6 +129,8 @@ class MediaJob(Base):
     unknown_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     provider_name: Mapped[str | None] = mapped_column(String(100))
     provider_version: Mapped[str | None] = mapped_column(String(100))
+    is_test_media: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    test_retention_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

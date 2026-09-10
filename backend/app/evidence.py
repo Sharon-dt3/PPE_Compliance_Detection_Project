@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,6 +15,72 @@ from app.detection import DetectedObject
 
 class PrivacyProcessingError(RuntimeError):
     """Raised when mandatory face detection or blurring cannot complete safely."""
+
+
+@dataclass(frozen=True)
+class FaceDetectorReadiness:
+    """Structured result of a face-detector model load-and-run verification.
+
+    ``status`` is one of ``"ready"`` (model loaded and produced an inference result),
+    ``"not_configured"`` (no model paths have been set yet -- expected in local
+    development before Phase 7 evidence is enabled), or ``"unavailable"`` (paths are set
+    but the files are missing, unreadable, or the model failed to load or run).
+    """
+
+    status: str
+    detail: str
+
+
+# PUBLIC_INTERFACE
+def check_face_detector_readiness() -> FaceDetectorReadiness:
+    """Verify the configured OpenCV DNN face-detector model loads and runs inference.
+
+    This implements Phase 1's "Day 1" requirement: confirm the approved face model
+    (``deploy.prototxt`` + ``res10_300x300_ssd_iter_140000_fp16.caffemodel``) loads and
+    runs in the application/worker environment, even though the full blur pipeline is not
+    wired into evidence review until Phase 7. Unlike ``_load_face_detector``, this never
+    raises: it returns a structured result so application startup logging and a health
+    endpoint can report readiness without crashing the process when the model is not yet
+    configured (the expected state in local development).
+
+    Returns:
+        A ``FaceDetectorReadiness`` describing whether the configured model is ready,
+        not yet configured, or configured but unavailable/failing.
+    """
+    if not settings.face_detector_prototxt_path or not settings.face_detector_model_path:
+        return FaceDetectorReadiness(
+            status="not_configured",
+            detail="Face-detector model paths are not configured; evidence generation will fail closed.",
+        )
+
+    prototxt = Path(settings.face_detector_prototxt_path)
+    model = Path(settings.face_detector_model_path)
+    if not prototxt.is_file() or not model.is_file():
+        return FaceDetectorReadiness(
+            status="unavailable",
+            detail="Configured face-detector model files are missing or unreadable.",
+        )
+
+    try:
+        detector = cv2.dnn.readNetFromCaffe(str(prototxt), str(model))
+        # A neutral, non-sensitive synthetic probe image -- this verifies the model can
+        # load and execute a real forward pass without depending on any private media.
+        probe = np.zeros((300, 300, 3), dtype=np.uint8)
+        blob = cv2.dnn.blobFromImage(probe, 1.0, (300, 300), (104.0, 177.0, 123.0))
+        detector.setInput(blob)
+        result = detector.forward()
+    except cv2.error as error:
+        return FaceDetectorReadiness(
+            status="unavailable",
+            detail=f"Configured face-detector model failed to load or run: {error}",
+        )
+
+    if not isinstance(result, np.ndarray) or result.ndim != 4 or result.shape[3] < 7:
+        return FaceDetectorReadiness(
+            status="unavailable",
+            detail="Configured face-detector model loaded but produced an invalid inference result.",
+        )
+    return FaceDetectorReadiness(status="ready", detail="Face-detector model loaded and ran successfully.")
 
 
 class EvidenceService:
@@ -36,13 +103,13 @@ class EvidenceService:
             PrivacyProcessingError: If the source cannot be read, detector assets are unavailable,
                 face detection fails, or the protected image cannot be saved.
         """
-        frame = self._read_first_frame(media_path)
+        frame = self._resize_for_evidence(self._read_first_frame(media_path))
         detector = self._load_face_detector()
-        annotated = self._annotate_safety_result(frame, objects, policy_result)
-        blurred = self._blur_detected_faces(annotated, detector)
+        blurred = self._blur_detected_faces(frame, detector)
+        annotated = self._annotate_safety_result(blurred, objects, policy_result)
         storage_key = f"{uuid4()}.jpg"
 
-        if not cv2.imwrite(str(self._root / storage_key), blurred):
+        if not cv2.imwrite(str(self._root / storage_key), annotated):
             raise PrivacyProcessingError("The privacy-processed evidence image could not be saved.")
         return storage_key
 
@@ -72,6 +139,21 @@ class EvidenceService:
         if not success or frame is None:
             raise PrivacyProcessingError("No readable evidence frame was available from the submitted media.")
         return frame
+
+    @staticmethod
+    def _resize_for_evidence(image: np.ndarray) -> np.ndarray:
+        """Bound stored evidence dimensions while preserving the original aspect ratio."""
+        height, width = image.shape[:2]
+        max_width = settings.max_evidence_image_width
+        max_height = settings.max_evidence_image_height
+        if max_width < 1 or max_height < 1:
+            raise PrivacyProcessingError("Evidence image dimension limits must be positive.")
+        scale = min(max_width / width, max_height / height, 1.0)
+        if scale == 1.0:
+            return image
+        resized_width = max(1, round(width * scale))
+        resized_height = max(1, round(height * scale))
+        return cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
 
     @staticmethod
     def _annotate_safety_result(
@@ -161,7 +243,11 @@ class EvidenceService:
 
     @staticmethod
     def _blur_detected_faces(image: np.ndarray, detector: cv2.dnn_Net) -> np.ndarray:
-        """Detect every face in one image and blur each safely bounded region."""
+        """Detect every face in one image and blur each safely bounded region.
+
+        Any malformed detector result is treated as a privacy-gate failure rather than
+        risking an unblurred image being stored or shown to a reviewer.
+        """
         height, width = image.shape[:2]
         blob = cv2.dnn.blobFromImage(cv2.resize(image, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
         try:
@@ -170,6 +256,9 @@ class EvidenceService:
         except cv2.error as error:
             raise PrivacyProcessingError("Face detection failed during evidence processing.") from error
 
+        if not isinstance(detections, np.ndarray) or detections.ndim != 4 or detections.shape[0:2] != (1, 1) or detections.shape[3] < 7:
+            raise PrivacyProcessingError("Face detection returned an invalid result.")
+
         output = image.copy()
         kernel_size = settings.face_blur_kernel_size
         if kernel_size < 3:
@@ -177,7 +266,10 @@ class EvidenceService:
         if kernel_size % 2 == 0:
             kernel_size += 1
 
-        for confidence, left, top, right, bottom in detections[0, 0, :, 2:7]:
+        for detection in detections[0, 0, :, 2:7]:
+            confidence, left, top, right, bottom = detection
+            if not np.isfinite(detection).all():
+                raise PrivacyProcessingError("Face detection returned an invalid result.")
             if float(confidence) < settings.face_detector_confidence:
                 continue
             pad_x = int((right - left) * width * settings.face_blur_padding_ratio)

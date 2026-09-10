@@ -2,6 +2,58 @@
 
 This local POC provides **indicative safety-support signals only**. It must not be used for employee performance monitoring, worker identification, facial recognition, persistent tracking, autonomous enforcement, or employment decisions.
 
+## Face-detector privacy-gate readiness
+
+`GET /health/face-detector` reports whether the mandatory OpenCV DNN face-detector model
+(`deploy.prototxt` + `res10_300x300_ssd_iter_140000_fp16.caffemodel`) is configured, loads,
+and successfully runs a forward pass — independent of whether any evidence has been
+processed yet. The same check runs once at application startup and logs its result.
+
+| `status` | Meaning | Operational action |
+| --- | --- | --- |
+| `ready` | The configured model loaded and produced a valid inference result. | None; evidence generation may proceed normally. |
+| `not_configured` | `PPE_FACE_DETECTOR_PROTOTXT_PATH` / `PPE_FACE_DETECTOR_MODEL_PATH` are unset. | Expected in local development. Configure both paths before enabling any evidence-generating deployment. |
+| `unavailable` | Paths are set, but the files are missing, unreadable, or the model failed to load or run. | Re-provision the approved model assets; every evidence attempt will fail closed until this is resolved. |
+
+This check never blocks the application from starting: a `not_configured` or
+`unavailable` result only means evidence generation will fail closed (Phase 7), consistent
+with `create_annotated_blurred_evidence` never producing an unblurred image.
+
+## Policy effective time window
+
+A zone policy version may optionally carry `effective_start` and `effective_end` UTC
+timestamps via `PATCH /api/v1/zones/{zone_id}/policy`. Both are optional; when unset, the
+policy version is effective for as long as it remains `active`. When both are supplied,
+`effective_end` must be strictly after `effective_start` or the request is rejected with a
+422 response. These fields are persisted and returned for administrator review; selecting
+among multiple time-scoped policy versions at evaluation time is a separate, not-yet-wired
+capability.
+
+## Maximum video frame rate
+
+`PPE_MAX_VIDEO_FPS` (default `60.0`) bounds the accepted native frame rate for uploaded
+MP4/MOV clips, alongside the existing frame-dimension and duration checks. An upload whose
+detected FPS exceeds this limit is rejected with a 422 response before it is queued for
+processing, and its already-saved private copy is deleted.
+
+## Concurrent media-job limit
+
+`PPE_MAX_CONCURRENT_JOBS` (default `5`) bounds how many media jobs may be simultaneously
+`queued` or `processing` at once. `POST /api/v1/media-jobs` returns `429 Too Many Requests`
+once this limit is reached; callers should retry after a short delay rather than treating
+this as a permanent failure.
+
+## Test-media retention approval workflow
+
+An upload may be marked `is_test_media=true` (an optional `POST /api/v1/media-jobs` query
+parameter) to identify it as non-operational test or demonstration content rather than real
+CCTV footage. Only a job flagged this way at upload time is eligible for
+`POST /api/v1/media-jobs/{job_id}/approve-test-retention`, restricted to the administrator
+role, which requires an explicit `retention_hours` (1-720) and a `justification` note and
+extends that job's private raw-media expiry accordingly. Attempting this workflow against a
+job not flagged as test media returns `409 Conflict` — real operational media can never have
+its retention extended through this endpoint.
+
 ## Scheduled retention task
 
 Celery Beat dispatches `ppe.remove_expired_private_data` hourly (`3600` seconds). The task independently processes these categories so a failure in one category does not prevent the others from running:

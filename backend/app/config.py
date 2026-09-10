@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     max_video_duration_seconds: int = 300
     max_frame_width: int = 3840
     max_frame_height: int = 2160
+    max_video_fps: float = 60.0
+    max_concurrent_jobs: int = 5
     evidence_retention_hours: int = 48
     raw_media_retention_hours: int = 1
     frame_observation_retention_hours: int = 24
@@ -21,6 +23,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     private_media_directory: str = "./data/private-media"
     private_evidence_directory: str = "./data/private-evidence"
+    max_evidence_image_width: int = 1920
+    max_evidence_image_height: int = 1080
 
     auth_mode: str = "demo"
     supabase_url: str = ""

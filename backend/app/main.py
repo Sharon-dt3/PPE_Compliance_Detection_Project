@@ -21,6 +21,7 @@ from app.audit import record_actor_audit_event
 from app.auth import AuthenticatedActor, Role, current_actor, require_role
 from app.config import settings
 from app.database import get_session, initialise_database
+from app.evidence import check_face_detector_readiness
 from app.logging_config import configure_logging, set_correlation_id
 from app.media_validation import validate_media_upload, validate_video_file
 from app.models import (
@@ -59,6 +60,8 @@ class PolicyResponse(BaseModel):
     persistence_frames: int
     deduplication_seconds: int
     sampling_fps: float | None
+    effective_start: datetime | None
+    effective_end: datetime | None
 
 
 class ZoneResponse(BaseModel):
@@ -126,6 +129,12 @@ class PolicyRequest(BaseModel):
     sampling_fps: float | None = Field(
         default=None, gt=0, le=30, description="Target detector sampling rate for video sources, e.g. 2-5 FPS; unset processes every frame."
     )
+    effective_start: datetime | None = Field(
+        default=None, description="Optional inclusive UTC timestamp when this policy version becomes effective."
+    )
+    effective_end: datetime | None = Field(
+        default=None, description="Optional inclusive UTC timestamp after which this policy version is no longer effective."
+    )
     active: bool = True
 
     @field_validator("class_confidence_thresholds")
@@ -138,6 +147,15 @@ class PolicyRequest(BaseModel):
                 raise ValueError(f"Unsupported PPE label '{label}'.")
             if not 0 <= threshold <= 1:
                 raise ValueError(f"Threshold for '{label}' must be between 0 and 1.")
+        return value
+
+    @field_validator("effective_end")
+    @classmethod
+    def _validate_effective_window(cls, value: datetime | None, info) -> datetime | None:
+        """Reject an effective end that is not after the effective start, when both are set."""
+        effective_start = info.data.get("effective_start")
+        if value is not None and effective_start is not None and value <= effective_start:
+            raise ValueError("effective_end must be after effective_start.")
         return value
 
 
@@ -167,12 +185,29 @@ class MediaJobResponse(BaseModel):
     unknown_count: int
     message: str
     failure_code: str | None
+    is_test_media: bool
+    test_retention_approved: bool
 
 
 class AlertActionRequest(BaseModel):
     """Supervisor-supplied safety intervention or resolution note."""
 
     note: str = Field(min_length=3, max_length=500, description="Non-identifying safety intervention or outcome note.")
+
+
+class TestMediaRetentionApprovalRequest(BaseModel):
+    """Administrator confirmation extending retention for one test-media job.
+
+    Only test media flagged at upload time (``is_test_media=True``) can go through this
+    approval workflow; approving retention for real operational media is not permitted.
+    """
+
+    retention_hours: int = Field(
+        ge=1, le=720, description="Administrator-approved retention duration in hours for this test-media job."
+    )
+    justification: str = Field(
+        min_length=3, max_length=500, description="Why this test-media job's private retention was extended."
+    )
 
 
 class AlertResponse(BaseModel):
@@ -441,6 +476,13 @@ async def startup() -> None:
     """Configure structured logging, then initialise the schema before accepting requests."""
     configure_logging()
     initialise_database()
+    readiness = check_face_detector_readiness()
+    if readiness.status == "ready":
+        logger.info("Face-detector privacy gate verified at startup: %s", readiness.detail)
+    elif readiness.status == "not_configured":
+        logger.warning("Face-detector privacy gate is not configured at startup: %s", readiness.detail)
+    else:
+        logger.error("Face-detector privacy gate is unavailable at startup: %s", readiness.detail)
 
 
 @app.get("/health", tags=["Health"], summary="Check service health")
@@ -448,6 +490,28 @@ async def startup() -> None:
 def health_check() -> dict[str, str]:
     """Return service health for local development and deployment checks."""
     return {"status": "healthy"}
+
+
+@app.get(
+    "/health/face-detector",
+    tags=["Health"],
+    summary="Check the mandatory face-detector privacy-gate readiness",
+)
+# PUBLIC_INTERFACE
+def face_detector_health() -> dict[str, str]:
+    """Report whether the configured face-detector model loads and runs inference.
+
+    Verifies Phase 1's "Day 1" requirement independently of any processed media: this
+    confirms the OpenCV DNN model itself is ready, not that the Phase 7 blur pipeline has
+    already run. A ``not_configured`` or ``unavailable`` status means every evidence
+    generation attempt will fail closed (no unblurred evidence is ever produced instead).
+
+    Returns:
+        A JSON object with ``status`` (``ready``, ``not_configured``, or ``unavailable``)
+        and a human-readable ``detail`` message; never raises for an unready model.
+    """
+    readiness = check_face_detector_readiness()
+    return {"status": readiness.status, "detail": readiness.detail}
 
 
 @app.get("/api/v1/me", response_model=MeResponse, tags=["Configuration"], summary="Get the authenticated caller's role")
@@ -820,6 +884,7 @@ def create_zone_policy_version(
 async def create_media_job(
     source_id: str,
     file: UploadFile = File(description="Private POC JPEG, PNG, MP4, or MOV upload."),
+    is_test_media: bool = False,
     session: Session = Depends(get_session),
     actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR)),
 ) -> MediaJobResponse:
@@ -828,6 +893,9 @@ async def create_media_job(
     Args:
         source_id: Enabled source whose zone selects the active safety policy.
         file: Uploaded CCTV still or recorded video clip.
+        is_test_media: Marks this upload as non-operational test/demo media. Test media is
+            eligible for the administrator-approved retention-extension workflow; real
+            operational media is not.
 
     Returns:
         A queued non-identifying job record. Private storage references are never returned.
@@ -838,6 +906,15 @@ async def create_media_job(
     policy = session.scalar(select(ZonePolicy).where(ZonePolicy.zone_id == source.zone_id, ZonePolicy.active.is_(True)))
     if policy is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The selected source has no active safety policy.")
+
+    in_flight_jobs = session.scalar(
+        select(func.count(MediaJob.id)).where(MediaJob.status.in_([JobStatus.QUEUED.value, JobStatus.PROCESSING.value]))
+    )
+    if in_flight_jobs is not None and in_flight_jobs >= settings.max_concurrent_jobs:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="The maximum number of concurrently processing media jobs has been reached. Retry shortly.",
+        )
 
     content = await file.read(settings.max_upload_bytes + 1)
     if not content:
@@ -865,6 +942,7 @@ async def create_media_job(
         content_type=validated.content_type,
         storage_key=storage_key,
         status=JobStatus.QUEUED.value,
+        is_test_media=is_test_media,
         expires_at=datetime.now(UTC) + timedelta(hours=get_platform_settings(session).raw_media_retention_hours),
     )
     session.add(job)
@@ -949,6 +1027,53 @@ def cancel_media_job(
     job.completed_at = datetime.now(UTC)
     job.message = "Processing was cancelled before a safety result was finalized."
     record_actor_audit_event(session, "media_job.cancelled", "media_job", job.id, actor, "Pending processing cancelled.")
+    session.commit()
+    session.refresh(job)
+    return _job_response(job)
+
+
+@app.post(
+    "/api/v1/media-jobs/{job_id}/approve-test-retention",
+    response_model=MediaJobResponse,
+    tags=["Media jobs"],
+    summary="Approve extended retention for test media",
+)
+# PUBLIC_INTERFACE
+def approve_test_media_retention(
+    job_id: str,
+    request: TestMediaRetentionApprovalRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> MediaJobResponse:
+    """Extend a test-media job's private raw-media retention with explicit administrator approval.
+
+    Only jobs uploaded with ``is_test_media=True`` are eligible: this workflow must never be
+    used to extend retention for real operational/CCTV media, since that would undermine the
+    fixed, non-identifying-by-default retention posture the POC otherwise guarantees.
+
+    Args:
+        job_id: The test-media job whose raw-media retention is being extended.
+        request: The approved retention duration (hours) and a required justification note.
+
+    Returns:
+        The updated job record showing its new expiry and approval state.
+    """
+    job = _get_job_or_404(session, job_id)
+    if not job.is_test_media:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only media explicitly flagged as test media at upload time is eligible for this workflow.",
+        )
+    job.test_retention_approved = True
+    job.expires_at = datetime.now(UTC) + timedelta(hours=request.retention_hours)
+    record_actor_audit_event(
+        session,
+        "media_job.test_retention_approved",
+        "media_job",
+        job.id,
+        actor,
+        f"Test-media retention extended to {request.retention_hours}h. Justification: {request.justification}",
+    )
     session.commit()
     session.refresh(job)
     return _job_response(job)
@@ -1307,6 +1432,8 @@ def _policy_response(policy: ZonePolicy) -> PolicyResponse:
         persistence_frames=policy.persistence_frames,
         deduplication_seconds=policy.deduplication_seconds,
         sampling_fps=policy.sampling_fps,
+        effective_start=policy.effective_start,
+        effective_end=policy.effective_end,
     )
 
 
@@ -1372,6 +1499,8 @@ def _job_response(job: MediaJob) -> MediaJobResponse:
         unknown_count=job.unknown_count,
         message=job.message,
         failure_code=job.failure_code,
+        is_test_media=job.is_test_media,
+        test_retention_approved=job.test_retention_approved,
     )
 
 
