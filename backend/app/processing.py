@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.audit import record_audit_event
 from app.config import settings
 from app.database import SessionLocal
-from app.decision import DecisionOutcome, SafetyDecisionService
+from app.decision import DecisionOutcome, RequirementDecision, SafetyDecisionService
 from app.detection import DetectedObject, DetectionOutcome, get_detection_provider
 from app.evidence import EvidenceService, PrivacyProcessingError
 from app.models import (
@@ -145,10 +145,24 @@ def _persist_outcome(
         "Non-identifying aggregate outcome persisted.",
     )
 
-    if not decision.persistence_met or not decision.failed_requirement:
-        return
+    # A job can carry more than one simultaneously persistent requirement (e.g. a zone
+    # requiring both helmet and vest, both violated) -- each becomes its own independently
+    # deduplicated alert rather than only the first one being reported.
+    for requirement_decision in decision.persistent_requirements:
+        _create_or_update_alert(session, job, policy, detections, media_path, requirement_decision, now)
 
-    deduplication_key = f"{job.source_id}:{policy.id}:{decision.failed_requirement}"
+
+def _create_or_update_alert(
+    session: Session,
+    job: MediaJob,
+    policy: SimpleNamespace,
+    detections: DetectionOutcome,
+    media_path: str,
+    requirement_decision: RequirementDecision,
+    now: datetime,
+) -> None:
+    """Create one requirement's alert, or merge into its existing deduplication window."""
+    deduplication_key = f"{job.source_id}:{policy.id}:{requirement_decision.requirement}"
     window_start = now - timedelta(seconds=policy.deduplication_seconds)
     alert = session.scalar(
         select(ComplianceAlert)
@@ -162,7 +176,7 @@ def _persist_outcome(
     if alert is not None:
         alert.last_observed_at = now
         alert.occurrence_count += 1
-        alert.confidence = max(alert.confidence, decision.confidence or 0)
+        alert.confidence = max(alert.confidence, requirement_decision.confidence or 0)
         record_audit_event(
             session,
             "alert.deduplicated",
@@ -180,8 +194,8 @@ def _persist_outcome(
         zone_id=job.zone_id,
         policy_id=policy.id,
         deduplication_key=deduplication_key,
-        failed_requirement=decision.failed_requirement,
-        confidence=decision.confidence or 0,
+        failed_requirement=requirement_decision.requirement,
+        confidence=requirement_decision.confidence or 0,
         first_observed_at=now,
         last_observed_at=now,
         evidence_available=False,
@@ -204,7 +218,7 @@ def _persist_outcome(
         storage_key = EvidenceService().create_annotated_blurred_evidence(
             media_path,
             evidence_objects,
-            decision.failed_requirement,
+            requirement_decision.requirement,
         )
     except PrivacyProcessingError:
         alert.evidence_message = "Evidence is unavailable because mandatory privacy processing did not complete."

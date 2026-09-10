@@ -11,9 +11,14 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from app.database import SessionLocal
+from app.database import SessionLocal, initialise_database
 from app.models import CameraSource, JobStatus, MediaJob, Zone, ZonePolicy
 from app.processing import process_media_job
+
+# This module drives SessionLocal() directly rather than through a TestClient(app), so it
+# cannot rely on another test file's app startup having already created the schema first --
+# pytest's file collection order is not a dependency any test should assume.
+initialise_database()
 
 
 def _create_job(

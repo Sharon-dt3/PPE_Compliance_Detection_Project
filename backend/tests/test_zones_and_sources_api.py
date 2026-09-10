@@ -8,6 +8,8 @@ once those became required response fields.
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -43,7 +45,9 @@ def test_policy_version_round_trips_class_confidence_thresholds() -> None:
     """A new policy version's per-class thresholds persist and are returned by list_zones."""
     admin = _demo_headers("administrator")
     with TestClient(app) as client:
-        created = client.post("/api/v1/zones", headers=admin, json={"name": "Threshold API zone", "description": "test"})
+        created = client.post(
+            "/api/v1/zones", headers=admin, json={"name": f"Threshold API zone {uuid4()}", "description": "test"}
+        )
         zone_id = created.json()["id"]
 
         patched = client.patch(
@@ -77,13 +81,15 @@ def test_source_confidence_threshold_override_round_trip() -> None:
     """A source's per-source threshold override can be set, listed, and cleared."""
     admin = _demo_headers("administrator")
     with TestClient(app) as client:
-        zone = client.post("/api/v1/zones", headers=admin, json={"name": "Source override zone", "description": "test"})
+        zone = client.post(
+            "/api/v1/zones", headers=admin, json={"name": f"Source override zone {uuid4()}", "description": "test"}
+        )
         zone_id = zone.json()["id"]
 
         created = client.post(
             "/api/v1/sources",
             headers=admin,
-            json={"name": "Source override camera", "zone_id": zone_id, "confidence_threshold_override": 0.6},
+            json={"name": f"Source override camera {uuid4()}", "zone_id": zone_id, "confidence_threshold_override": 0.6},
         )
         assert created.status_code == 201
         assert created.json()["confidence_threshold_override"] == 0.6
