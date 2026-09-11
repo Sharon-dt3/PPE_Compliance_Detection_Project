@@ -292,3 +292,68 @@ screen if persisted rows are also wanted. Any row added for `Hexmon` should carr
 `poc_only` state and the same licence-dispute caveat as `Hansung-Cho`'s existing row, not a
 higher approval state — a strong benchmark result on this held-out set is not the same as a
 completed production-approval review, and does not resolve an open licence question either.
+
+## Verified video/demo sources (2026-09-11/12)
+
+The original implementation plan's "Verified video sources" section makes several claims
+that were checked directly rather than taken on trust — two turned out to be wrong.
+
+### Demo Spaces: one doesn't exist, one is broken
+
+The plan states "Both primary models ship working Hugging Face Spaces." Checked directly:
+
+- **`melihuzunoglu/ppe-detection` has no demo Space at all.** Its model card carries no
+  linked Space, and the author's full Hugging Face profile
+  ([huggingface.co/melihuzunoglu](https://huggingface.co/melihuzunoglu)) shows exactly one
+  Space — an unrelated electricity-outage lookup tool, not a PPE demo. The plan's claim is
+  false for this model; there is no live browser demo to point anyone to for it.
+- **The `hafizqaim/Workspace-Safety-Detection` Space
+  ([huggingface.co/spaces/hafizqaim/Workspace-Safety-Detection](https://huggingface.co/spaces/hafizqaim/Workspace-Safety-Detection))
+  exists but is currently broken** — "Runtime error, exit code 137" (looks OOM-killed), not
+  usable as a live demo as of this check.
+
+Neither issue is something this project can fix (both are third-party-hosted); the finding
+is that this specific "fastest start" path the plan describes is not actually available, so
+it should not be relied on for a stand-up demo without re-checking it closer to the time.
+
+### Pexels
+
+Confirmed directly: pexels.com genuinely has industrial-worker stock video (45.9K results
+for "industrial worker," with dedicated Construction Worker / Warehouse Worker / Factory
+Worker categories in the tens of thousands each). The plan's claim holds; per-clip licence
+terms still need checking individually before use, as the plan itself already notes.
+
+### Supplementary datasets — licence audit
+
+None of the four "Supplementary sets" the plan lists had actually been checked before now.
+Checked directly against each dataset's own authoritative page:
+
+| Dataset | Licence (verified) | Notes |
+| --- | --- | --- |
+| **Hard Hat Universe** | **Public Domain**, confirmed directly on its [Roboflow Universe page](https://universe.roboflow.com/universe-datasets/hard-hat-universe-0dy7t) | 7,036 images, 6 classes (`head`, `helmet`, `person`, `hi-viz helmet`, `hi-viz vest`, `random`). Commercially clean; usable beyond benchmarking if wanted. |
+| **Safety_PPE** | **CC BY 4.0**, confirmed directly on its [Roboflow Universe page](https://universe.roboflow.com/safety-jmser/safety_ppe) | 6,629 images, **12 classes** — broader than the plan's "person, helmet, glove, goggle, shoes" description: also includes explicit `No_Helmet`/`No_Glove`/`No_Goggles`/`No_Harness`/`No_Shoe`/`No_BreathingApparatus` negative classes and `Safety_Harness`. Commercially usable with attribution. |
+| **SHEL5K** | **Unverified — could not be confirmed either way** | Its Mendeley Data page ([data.mendeley.com/datasets/9rcv8mm682/4](https://data.mendeley.com/datasets/9rcv8mm682/4)) is inaccessible to this project's tooling (JS-rendered page, blocked to automated fetches). Its GitHub mirror ([github.com/MoyoG/SHEL5K](https://github.com/MoyoG/SHEL5K)) carries no LICENSE file and no dataset files at all — only the paper reference. The plan's own "Check terms" caveat stands; do not treat this as licence-clean without someone manually opening the Mendeley page. |
+| **CHV** (Color Helmet and Vest) | **No formal licence** | Its actual source is [github.com/ZijianWang-ZW/PPE_detection](https://github.com/ZijianWang-ZW/PPE_detection) (the plan's "Comparative study (paper)" link resolves here). The README states only an informal "open for free use," with no LICENSE file and no formal grant. 1,330 images were selected from "10,000 [images] from the Internet and open datasets" — individual image provenance is unstated. Fine for the plan's own scoped use (benchmarking reference only, per its own framing), but not something to train shippable weights on without further diligence — same caveat class as SH17, just informally licensed rather than explicitly non-commercial. |
+
+### Face-blur "out of scope" claim
+
+The plan text lists "face blurring/anonymisation pipeline" under "Out of scope (Phase 2)."
+This project's own in-repo planning docs do not repeat that framing and are already
+consistent with what was actually built:
+[`ppe-compliance-poc-implementation-plan.md`](ppe-compliance-poc-implementation-plan.md)'s
+own out-of-scope list names only live RTSP/VMS integration, on-site deployment, formal
+DPIA/works-council approval, and production tuning on Renewi footage — face-blur is not on
+it. Face-blur was in fact built as a mandatory, fail-closed Phase 7 requirement (see
+[Technology Decision §1](../../../../../backend/models/face_detector/README.md) and the
+evidence pipeline in `app/evidence.py`), not deferred. There is nothing to reconcile inside
+this project's own documentation; the "out of scope" framing exists only in the separate,
+external plan text and is stale on this one point.
+
+### Live app video-upload test — still blocked
+
+The one item from this audit that remains genuinely open: testing video ingestion through
+the running application's own upload UI (as opposed to the direct Roboflow-API test above,
+which exercises the same frame-decode/sample logic but not the app's auth, database, or
+upload endpoint). This requires Supabase, which was re-checked on 2026-09-12 and is still
+unreachable (`curl` to its auth health endpoint times out) — a genuine, ongoing third-party
+platform outage, not something this project can work around locally.
