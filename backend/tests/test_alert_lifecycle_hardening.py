@@ -294,3 +294,46 @@ def test_supervisor_can_view_alert_metrics() -> None:
         response = client.get("/api/v1/reports/alerts", headers=_demo_headers("safety_supervisor"))
 
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# In-app new-alert indicator (the response loop's "who receives an alert" answer)
+# ---------------------------------------------------------------------------
+
+
+def test_open_alert_count_reflects_a_newly_created_open_alert() -> None:
+    """The poll-friendly count goes up by exactly one for one new open alert."""
+    with TestClient(app) as client:
+        before = client.get("/api/v1/alerts/open-count", headers=_demo_headers("safety_supervisor")).json()["open_count"]
+
+        with SessionLocal() as session:
+            _create_alert(session, status="open", evidence_available=False)
+
+        after = client.get("/api/v1/alerts/open-count", headers=_demo_headers("safety_supervisor")).json()["open_count"]
+
+    assert after == before + 1
+
+
+def test_open_alert_count_excludes_non_open_alerts() -> None:
+    """Acknowledged, resolved, cancelled, and expired alerts must not inflate the badge."""
+    with TestClient(app) as client:
+        before = client.get("/api/v1/alerts/open-count", headers=_demo_headers("safety_supervisor")).json()["open_count"]
+
+        with SessionLocal() as session:
+            _create_alert(session, status="acknowledged", evidence_available=False)
+            _create_alert(session, status="resolved", evidence_available=False)
+            _create_alert(session, status="cancelled", evidence_available=False)
+            _create_alert(session, status="expired", evidence_available=False)
+
+        after = client.get("/api/v1/alerts/open-count", headers=_demo_headers("safety_supervisor")).json()["open_count"]
+
+    assert after == before
+
+
+def test_demo_viewer_can_see_the_open_alert_count() -> None:
+    """The count is available to every role that can already see the alerts list."""
+    with TestClient(app) as client:
+        response = client.get("/api/v1/alerts/open-count", headers=_demo_headers("demonstration_viewer"))
+
+    assert response.status_code == 200
+    assert isinstance(response.json()["open_count"], int)

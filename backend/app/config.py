@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     max_frame_height: int = 2160
     max_video_fps: float = 60.0
     max_concurrent_jobs: int = 5
+    live_capture_interval_seconds: float = 300.0
+    live_capture_duration_seconds: float = 10.0
     evidence_retention_hours: int = 48
     raw_media_retention_hours: int = 1
     frame_observation_retention_hours: int = 24

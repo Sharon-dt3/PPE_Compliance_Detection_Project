@@ -91,6 +91,20 @@ p { line-height: 1.55; }
 .nav-item:hover,
 .nav-item.active { background: #243b53; border-color: #334e68; color: #fff; }
 
+.nav-badge {
+  background: #c0152f;
+  border-radius: 999px;
+  color: #fff;
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+  margin-left: 0.5rem;
+  min-width: 1.25rem;
+  padding: 0.15rem 0.4rem;
+  text-align: center;
+}
+
 .session-panel {
   border-top: 1px solid #334e68;
   display: grid;

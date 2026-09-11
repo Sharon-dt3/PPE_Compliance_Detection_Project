@@ -75,12 +75,17 @@ class ZoneResponse(BaseModel):
 
 
 class SourceResponse(BaseModel):
-    """Public representation of an enabled camera source."""
+    """Public representation of an enabled camera source.
+
+    ``live_capture_enabled`` reports only whether an RTSP/VMS URL is configured; the URL
+    itself (which routinely embeds camera credentials) is never returned by any endpoint.
+    """
 
     id: str
     name: str
     zone_id: str
     confidence_threshold_override: float | None
+    live_capture_enabled: bool
 
 
 class ZoneRequest(BaseModel):
@@ -100,6 +105,11 @@ class SourceRequest(BaseModel):
     confidence_threshold_override: float | None = Field(
         default=None, ge=0, le=1, description="Replaces the zone policy's flat threshold for this source only (FR-DET-05)."
     )
+    stream_url: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional RTSP/VMS live-camera feed URL, periodically captured into a media job. Write-only -- never returned by any endpoint.",
+    )
 
 
 class SourceUpdateRequest(BaseModel):
@@ -112,6 +122,8 @@ class SourceUpdateRequest(BaseModel):
     clear_confidence_threshold_override: bool = Field(
         default=False, description="Set true to remove a previously configured override and fall back to the zone policy."
     )
+    stream_url: str | None = Field(default=None, max_length=2000)
+    clear_stream_url: bool = Field(default=False, description="Set true to remove the configured live-camera feed and disable live capture.")
 
 
 class PolicyRequest(BaseModel):
@@ -230,6 +242,12 @@ class AlertResponse(BaseModel):
     resolution_note: str | None
     evidence_available: bool
     evidence_message: str
+
+
+class OpenAlertCountResponse(BaseModel):
+    """A cheap, poll-friendly count for an in-app new-alert indicator."""
+
+    open_count: int
 
 
 class RuleResultResponse(BaseModel):
@@ -843,10 +861,7 @@ def list_sources(
 ) -> list[SourceResponse]:
     """Return enabled manually selectable sources for private POC media submission."""
     sources = session.scalars(select(CameraSource).where(CameraSource.enabled.is_(True)).order_by(CameraSource.name)).all()
-    return [
-        SourceResponse(id=item.id, name=item.name, zone_id=item.zone_id, confidence_threshold_override=item.confidence_threshold_override)
-        for item in sources
-    ]
+    return [_source_response(item) for item in sources]
 
 
 @app.post(
@@ -872,10 +887,7 @@ def create_source(
     session.flush()
     record_actor_audit_event(session, "configuration.source_created", "camera_source", source.id, actor, "Camera source created.")
     session.commit()
-    return SourceResponse(
-        id=source.id, name=source.name, zone_id=source.zone_id,
-        confidence_threshold_override=source.confidence_threshold_override,
-    )
+    return _source_response(source)
 
 
 @app.get("/api/v1/sources/{source_id}", response_model=SourceResponse, tags=["Configuration"], summary="Get camera source configuration")
@@ -889,10 +901,7 @@ def get_source(
     source = session.get(CameraSource, source_id)
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured camera source not found.")
-    return SourceResponse(
-        id=source.id, name=source.name, zone_id=source.zone_id,
-        confidence_threshold_override=source.confidence_threshold_override,
-    )
+    return _source_response(source)
 
 
 @app.patch("/api/v1/sources/{source_id}", response_model=SourceResponse, tags=["Configuration"], summary="Update a camera source")
@@ -907,9 +916,11 @@ def update_source(
     source = session.get(CameraSource, source_id)
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured camera source not found.")
-    changes = request.model_dump(exclude_none=True, exclude={"clear_confidence_threshold_override"})
+    changes = request.model_dump(exclude_none=True, exclude={"clear_confidence_threshold_override", "clear_stream_url"})
     if request.clear_confidence_threshold_override:
         changes["confidence_threshold_override"] = None
+    if request.clear_stream_url:
+        changes["stream_url"] = None
     if not changes:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one source property must be supplied.")
     if "zone_id" in changes and session.get(Zone, changes["zone_id"]) is None:
@@ -921,10 +932,54 @@ def update_source(
         setattr(source, field, value)
     record_actor_audit_event(session, "configuration.source_updated", "camera_source", source.id, actor, "Camera source configuration changed.")
     session.commit()
-    return SourceResponse(
-        id=source.id, name=source.name, zone_id=source.zone_id,
-        confidence_threshold_override=source.confidence_threshold_override,
-    )
+    return _source_response(source)
+
+
+@app.post(
+    "/api/v1/sources/{source_id}/capture-now",
+    response_model=MediaJobResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Configuration"],
+    summary="Capture one clip from a live camera source immediately",
+)
+# PUBLIC_INTERFACE
+def capture_source_now(
+    source_id: str,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.ADMINISTRATOR)),
+) -> MediaJobResponse:
+    """Pull one clip from a live-enabled source's RTSP/VMS feed on demand, outside the schedule.
+
+    Reuses the exact same job-creation and processing path as a manual upload or the
+    scheduled live-capture sweep (`app/live_capture.py`) -- useful for testing a newly
+    configured camera or for a live demonstration without waiting for the next scheduled
+    interval. Requires `stream_url` to already be configured via `PATCH /api/v1/sources/{id}`.
+    """
+    from app.live_capture import LiveCaptureConcurrencyLimitError, LiveCaptureError, queue_live_capture_job
+
+    source = session.get(CameraSource, source_id)
+    if source is None or not source.enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured camera source not found.")
+    if not source.stream_url:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This source has no configured live-camera feed.")
+
+    try:
+        job = queue_live_capture_job(session, source)
+    except LiveCaptureConcurrencyLimitError as error:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(error)) from error
+    except LiveCaptureError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+    record_actor_audit_event(session, "media_job.created", "media_job", job.id, actor, "On-demand live-camera capture accepted.")
+    session.commit()
+    session.refresh(job)
+
+    try:
+        process_media_job_task.delay(job.id)
+    except Exception:
+        job.message = "Queued safely. The worker is currently unavailable; processing will resume when it is restored."
+        session.commit()
+    return _job_response(job)
 
 
 @app.patch("/api/v1/zones/{zone_id}/policy", response_model=PolicyResponse, tags=["Configuration"], summary="Create and activate a zone policy version")
@@ -1216,6 +1271,30 @@ def list_alerts(
     """Return persisted non-identifying safety alerts without raw media locations."""
     alerts = session.scalars(select(ComplianceAlert).order_by(ComplianceAlert.created_at.desc())).all()
     return [_alert_response(item) for item in alerts]
+
+
+@app.get(
+    "/api/v1/alerts/open-count",
+    response_model=OpenAlertCountResponse,
+    tags=["Alerts"],
+    summary="Get the current open-alert count",
+)
+# PUBLIC_INTERFACE
+def get_open_alert_count(
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(
+        require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.DEMO_VIEWER)
+    ),
+) -> OpenAlertCountResponse:
+    """Return a cheap, poll-friendly count for an in-app "who receives an alert" indicator.
+
+    This is the POC's answer to the response-loop's notification question: rather than an
+    external push channel (email/webhook, both requiring infrastructure this environment
+    doesn't have configured), any authenticated reviewer's own client polls this endpoint to
+    show a live new-alert badge without needing to already be on the alerts screen.
+    """
+    open_count = session.scalar(select(func.count(ComplianceAlert.id)).where(ComplianceAlert.status == "open"))
+    return OpenAlertCountResponse(open_count=open_count or 0)
 
 
 @app.post(
@@ -1650,6 +1729,17 @@ def _policy_response(policy: ZonePolicy) -> PolicyResponse:
 def _zone_response(zone: Zone, policy: ZonePolicy) -> ZoneResponse:
     """Convert a safety zone and its active policy to the public configuration shape."""
     return ZoneResponse(id=zone.id, name=zone.name, description=zone.description, policy=_policy_response(policy))
+
+
+def _source_response(source: CameraSource) -> SourceResponse:
+    """Convert a persisted source to its public shape; never includes the raw stream URL."""
+    return SourceResponse(
+        id=source.id,
+        name=source.name,
+        zone_id=source.zone_id,
+        confidence_threshold_override=source.confidence_threshold_override,
+        live_capture_enabled=bool(source.stream_url),
+    )
 
 
 def _as_utc(value: datetime) -> datetime:

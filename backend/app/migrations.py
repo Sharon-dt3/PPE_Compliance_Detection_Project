@@ -37,6 +37,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260910_test_media_retention", _upgrade_test_media_retention),
         ("20260911_evidence_blurred_constraint", _upgrade_evidence_blurred_constraint),
         ("20260912_shift_schedule", _upgrade_shift_schedule),
+        ("20260912_source_stream_url", _upgrade_source_stream_url),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -218,6 +219,11 @@ def _upgrade_platform_settings(connection: Connection) -> None:
         ),
         params,
     )
+
+
+def _upgrade_source_stream_url(connection: Connection) -> None:
+    """Add the optional RTSP/VMS live-camera-feed URL for a camera source."""
+    _add_missing_columns(connection, "camera_sources", {"stream_url": "TEXT"})
 
 
 def _upgrade_evidence_demo_approved(connection: Connection) -> None:

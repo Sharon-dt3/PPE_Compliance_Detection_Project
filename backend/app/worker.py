@@ -18,7 +18,11 @@ celery_app.conf.update(
         "remove-expired-private-data-hourly": {
             "task": "ppe.remove_expired_private_data",
             "schedule": 3600.0,
-        }
+        },
+        "capture-live-sources": {
+            "task": "ppe.capture_live_sources",
+            "schedule": settings.live_capture_interval_seconds,
+        },
     },
 )
 
@@ -47,5 +51,25 @@ def remove_expired_private_data_task() -> dict[str, object]:
     set_correlation_id(f"retention-{uuid.uuid4()}")
     try:
         return remove_expired_private_data().as_monitoring_payload()
+    finally:
+        set_correlation_id(None)
+
+
+@celery_app.task(name="ppe.capture_live_sources")
+def capture_live_sources_task() -> dict[str, object]:
+    """Capture one clip from every live-enabled camera source and queue it for processing.
+
+    Runs on ``live_capture_interval_seconds``. One camera's failure (offline, unreachable,
+    misconfigured URL) is isolated and does not block capture from the rest of the fleet,
+    matching this codebase's existing per-item-isolated pattern in retention cleanup.
+    """
+    from app.live_capture import capture_live_sources
+
+    set_correlation_id(f"live-capture-{uuid.uuid4()}")
+    try:
+        result = capture_live_sources()
+        for job_id in result.queued_job_ids:
+            process_media_job_task.delay(job_id)
+        return {"sources_captured": len(result.queued_job_ids), "sources_failed": len(result.failed_source_ids)}
     finally:
         set_correlation_id(None)

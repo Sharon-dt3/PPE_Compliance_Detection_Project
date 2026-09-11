@@ -445,6 +445,7 @@ function App() {
   const [report, setReport] = useState<Report | null>(null);
   const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [alertMetrics, setAlertMetrics] = useState<AlertMetrics | null>(null);
+  const [openAlertCount, setOpenAlertCount] = useState(0);
   const [evaluations, setEvaluations] = useState<ModelEvaluation[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [users, setUsers] = useState<PlatformUser[]>([]);
@@ -538,6 +539,23 @@ function App() {
     const timer = window.setInterval(() => void loadForRole(role), 3000);
     return () => window.clearInterval(timer);
   }, [jobs, role]);
+
+  // The response loop's "who receives an alert" answer for this POC: rather than an
+  // external push channel (email/webhook both need infrastructure this environment doesn't
+  // have configured), any client with the app open polls a live open-alert count, shown as
+  // a badge on the Safety alerts nav item -- independent of whether a media job happens to
+  // be in flight, unlike the poll above.
+  useEffect(() => {
+    if (!role || !NAVIGATION.find((item) => item.view === "alerts")?.roles.includes(role)) return undefined;
+    const poll = () => {
+      request<{ open_count: number }>(role, "/api/v1/alerts/open-count")
+        .then((result) => setOpenAlertCount(result.open_count))
+        .catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 10_000);
+    return () => window.clearInterval(timer);
+  }, [role]);
 
   const changeRole = (nextRole: Role) => {
     window.sessionStorage.setItem("ppe-demo-role", nextRole);
@@ -1189,7 +1207,12 @@ function App() {
       <aside className="sidebar">
         <div><p className="eyebrow">Safety POC</p><h1>PPE Compliance</h1></div>
         <nav aria-label="Primary navigation">
-          {allowedNavigation.map((item) => <button className={`nav-item ${activeView === item.view ? "active" : ""}`} key={item.view} type="button" onClick={() => navigate(item.view)}>{item.label}</button>)}
+          {allowedNavigation.map((item) => (
+            <button className={`nav-item ${activeView === item.view ? "active" : ""}`} key={item.view} type="button" onClick={() => navigate(item.view)}>
+              {item.label}
+              {item.view === "alerts" && openAlertCount > 0 && <span className="nav-badge" aria-label={`${openAlertCount} open safety alerts`}>{openAlertCount}</span>}
+            </button>
+          ))}
         </nav>
         <div className="session-panel">
           {AUTH_MODE === "demo"

@@ -98,6 +98,13 @@ class CameraSource(Base):
     ``confidence_threshold`` for jobs from this source only (FR-DET-05) — for example, a
     higher-mounted or lower-quality camera that needs a stricter threshold than its zone's
     other sources. Per-class overrides still come from the zone policy either way.
+
+    ``stream_url``, when set, is an RTSP/VMS live-camera feed URL periodically captured by
+    the live-capture worker (see ``app/live_capture.py``) into an ordinary media job that
+    then runs through the exact same detect/decide/alert pipeline as an uploaded file. It
+    routinely embeds camera credentials and must never be returned by any API response --
+    only a derived ``live_capture_enabled`` boolean is, the same non-leaking pattern already
+    used for private storage keys.
     """
 
     __tablename__ = "camera_sources"
@@ -107,6 +114,7 @@ class CameraSource(Base):
     zone_id: Mapped[str] = mapped_column(ForeignKey("zones.id"), nullable=False, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     confidence_threshold_override: Mapped[float | None] = mapped_column(Float)
+    stream_url: Mapped[str | None] = mapped_column(Text)
 
 
 class MediaJob(Base):

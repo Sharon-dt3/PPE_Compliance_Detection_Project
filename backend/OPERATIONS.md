@@ -82,6 +82,44 @@ processing, and its already-saved private copy is deleted.
 once this limit is reached; callers should retry after a short delay rather than treating
 this as a permanent failure.
 
+## Live camera capture (RTSP/VMS)
+
+`CameraSource.stream_url`, set via `PATCH /api/v1/sources/{id}` (never returned by any
+endpoint — it routinely embeds camera credentials; `SourceResponse.live_capture_enabled`
+reports only whether one is configured), lets a source be periodically captured from a live
+feed instead of only accepting manual uploads. A scheduled task
+(`PPE_LIVE_CAPTURE_INTERVAL_SECONDS`, default `300`) pulls a
+`PPE_LIVE_CAPTURE_DURATION_SECONDS`-long clip (default `10`) from every enabled,
+live-configured source via `cv2.VideoCapture` and queues it as an ordinary media job — the
+existing detect/decide/alert/dashboard pipeline needs no changes, and the same
+`PPE_MAX_CONCURRENT_JOBS` limit applies. One camera being offline or misconfigured is
+isolated and never blocks capture from the rest of the fleet. `POST
+/api/v1/sources/{id}/capture-now` (supervisor or administrator) triggers an immediate
+out-of-schedule capture, useful for testing a newly configured camera or a live
+demonstration.
+
+**Validation status, stated plainly:** this environment's OpenCV build is confirmed
+FFmpeg-backed, so `cv2.VideoCapture("rtsp://...")` genuinely opens real RTSP streams — this
+is not a theoretical capability. The capture/write/error-handling logic itself is tested
+(`backend/tests/test_live_capture.py`) using a local video file as the source, which
+exercises the identical `cv2.VideoCapture` code path OpenCV uses for a network URL. What is
+**not** validated is a live network RTSP connection end to end: two well-known public RTSP
+test streams checked during development were respectively no longer resolvable (DNS) and
+returning a `403 Forbidden` from their own server — third-party infrastructure issues, not
+an issue with this code. Real validation still needs either a freshly provisioned, currently
+reachable RTSP test server, or Renewi's own cameras (DPIA-gated, see the Phase 2 pilot scope
+memo).
+
+## In-app new-alert indicator (response-loop notification)
+
+`GET /api/v1/alerts/open-count` returns a cheap `{"open_count": N}` for polling. The
+frontend polls it independently of media-job activity and shows the count as a badge on the
+Safety Alerts nav item — this is the POC's deliberate answer to "who receives an alert":
+in-app only, not email or a webhook, since neither has real infrastructure configured in
+this environment (SMTP credentials, a webhook target). Revisit for a real pilot: an
+in-app badge still requires the reviewer's client to already be open somewhere, which is a
+weaker guarantee than a push/page/SMS escalation for a safety-critical alert.
+
 ## Test-media retention approval workflow
 
 An upload may be marked `is_test_media=true` (an optional `POST /api/v1/media-jobs` query
@@ -118,6 +156,8 @@ Use the platform environment-management workflow for non-secret configuration. N
 | `PPE_FRAME_OBSERVATION_RETENTION_HOURS` | `24` | Duration before a persisted, non-identifying frame summary expires. |
 | `PPE_EVIDENCE_RETENTION_HOURS` | `48` | Default POC evidence setting; the active zone-policy version ultimately sets individual evidence expiry and is API-limited to 24–72 hours. |
 | `PPE_SHIFT_SCHEDULE_JSON` | `{"day": [6, 18], "night": [18, 6]}` | Shift-name to `[start_hour, end_hour)` UTC window map used to label each dashboard rollup for shift-scoped reporting (FR-RPT-01). A window may wrap past midnight. Administrator-editable at runtime via `GET`/`PATCH /api/v1/settings/reporting`; a job completed outside every configured window is labelled `"unspecified"`. |
+| `PPE_LIVE_CAPTURE_INTERVAL_SECONDS` | `300` | How often the scheduled task pulls a fresh clip from every enabled, live-configured (`stream_url` set) camera source. |
+| `PPE_LIVE_CAPTURE_DURATION_SECONDS` | `10` | Length of each pulled clip. |
 
 ## Starting scheduled cleanup
 
