@@ -191,9 +191,11 @@ class MediaJobResponse(BaseModel):
 
 
 class AlertActionRequest(BaseModel):
-    """Supervisor-supplied safety intervention or resolution note."""
+    """Supervisor-supplied safety intervention or resolution note (FR-ALERT-03: optional)."""
 
-    note: str = Field(min_length=3, max_length=500, description="Non-identifying safety intervention or outcome note.")
+    note: str | None = Field(
+        default=None, min_length=3, max_length=500, description="Optional non-identifying safety intervention or outcome note."
+    )
 
 
 class TestMediaRetentionApprovalRequest(BaseModel):
@@ -1188,6 +1190,35 @@ def resolve_alert(
     return _alert_response(alert)
 
 
+@app.post("/api/v1/alerts/{alert_id}/cancel", response_model=AlertResponse, tags=["Alerts"], summary="Cancel a safety alert")
+# PUBLIC_INTERFACE
+def cancel_alert(
+    alert_id: str,
+    request: AlertActionRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.ADMINISTRATOR)),
+) -> AlertResponse:
+    """Cancel an open alert that a reviewer has determined was raised in error (FR-ALERT-02).
+
+    Distinct from `resolve`: resolution records a genuine safety event that was addressed,
+    while cancellation records that the alert should never have been treated as a real
+    finding (e.g. a detector false positive) -- so only an `open` alert, not yet acted on
+    via acknowledgement, may be cancelled.
+    """
+    alert = _get_alert_or_404(session, alert_id)
+    if alert.status != "open":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only open alerts may be cancelled.")
+    prior_status = alert.status
+    alert.status = "cancelled"
+    alert.resolved_at = datetime.now(UTC)
+    alert.resolution_note = request.note
+    _record_acknowledgement(session, alert, actor, prior_status, request.note)
+    record_actor_audit_event(session, "alert.cancelled", "compliance_alert", alert.id, actor, "Alert cancelled as raised in error.")
+    session.commit()
+    session.refresh(alert)
+    return _alert_response(alert)
+
+
 @app.get(
     "/api/v1/alerts/{alert_id}/rule-results",
     response_model=list[RuleResultResponse],
@@ -1384,7 +1415,7 @@ def compliance_report(
     end_at: Annotated[datetime | None, Query(description="Inclusive report end timestamp.")] = None,
     session: Session = Depends(get_session),
     _: AuthenticatedActor = Depends(
-        require_role(Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)
+        require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)
     ),
 ) -> ComplianceReport:
     """Return scoped aggregate non-identifying compliance metrics for the dashboard."""
@@ -1409,7 +1440,7 @@ def compliance_trend(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     session: Session = Depends(get_session),
-    _: AuthenticatedActor = Depends(require_role(Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)),
+    _: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)),
 ) -> list[TrendPoint]:
     """Return daily aggregate trend points with observed and unknown counts."""
     return [TrendPoint(**row) for row in AggregateReportingService().daily_trend(session, _report_filters(zone_id, source_id, shift, rule_key, start_at, end_at))]
@@ -1423,7 +1454,7 @@ def alert_metrics_report(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     session: Session = Depends(get_session),
-    _: AuthenticatedActor = Depends(require_role(Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)),
+    _: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)),
 ) -> AlertMetricsReport:
     """Return scoped lifecycle counts and human-review timing metrics without evidence."""
     metrics = AggregateReportingService().alert_totals(session, _report_filters(zone_id, source_id, None, None, start_at, end_at))
@@ -1635,14 +1666,16 @@ def _record_acknowledgement(
     alert: ComplianceAlert,
     actor: AuthenticatedActor,
     prior_status: str,
-    note: str,
+    note: str | None,
 ) -> None:
     """Append one human-review action to the alert's full acknowledgement history.
 
     Distinct from the audit log and from the latest-note fields still kept on the alert
     itself for quick display: this is the durable, queryable "timestamp, operator
     reference, prior state, next state, note" record for every action, not only the most
-    recent one.
+    recent one. The note itself is optional (FR-ALERT-03); ``EventAcknowledgement.note``
+    stays a required column, so an omitted note is recorded as an empty string rather than
+    changing that column's nullability.
     """
     session.add(
         EventAcknowledgement(
@@ -1651,7 +1684,7 @@ def _record_acknowledgement(
             actor_role=actor.role.value,
             prior_status=prior_status,
             next_status=alert.status,
-            note=note,
+            note=note or "",
         )
     )
 

@@ -188,7 +188,7 @@ const ROLE_LABELS: Record<Role, string> = {
 };
 
 const NAVIGATION: NavigationItem[] = [
-  { view: "dashboard", label: "Dashboard", roles: ["hse_manager", "administrator", "governance_reviewer", "demonstration_viewer"] },
+  { view: "dashboard", label: "Dashboard", roles: ["safety_supervisor", "hse_manager", "administrator", "governance_reviewer", "demonstration_viewer"] },
   { view: "media", label: "Media jobs", roles: ["safety_supervisor", "hse_manager", "administrator"] },
   { view: "media-new", label: "New upload", roles: ["safety_supervisor", "hse_manager", "administrator"] },
   { view: "alerts", label: "Safety alerts", roles: ["safety_supervisor", "hse_manager", "administrator", "demonstration_viewer"] },

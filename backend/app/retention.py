@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 
 from sqlalchemy import delete, select
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.audit import record_audit_event
 from app.database import SessionLocal
-from app.models import EvidenceSnapshot, FrameObservation, MediaJob, PersonObservation
+from app.models import AlertStatus, ComplianceAlert, EvidenceSnapshot, FrameObservation, MediaJob, PersonObservation, ZonePolicy
 from app.storage import PrivateMediaStorage
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class RetentionResult:
     expired_evidence_deleted: int = 0
     expired_frame_summaries_deleted: int = 0
     expired_person_summaries_deleted: int = 0
+    expired_alerts: int = 0
     failures: int = 0
     failure_categories: tuple[str, ...] = ()
 
@@ -97,12 +98,13 @@ def remove_expired_private_data_for_session(
     evidence_deleted = _remove_expired_evidence(session, private_evidence, execution_time, failure_categories)
     frame_deleted = _remove_expired_frame_summaries(session, execution_time, failure_categories)
     person_deleted = _remove_expired_person_summaries(session, execution_time, failure_categories)
+    alerts_expired = _expire_stale_alerts(session, execution_time, failure_categories)
 
     failures = len(failure_categories)
     status: RetentionStatus
     if failures == 0:
         status = "completed"
-    elif media_deleted or evidence_deleted or frame_deleted or person_deleted:
+    elif media_deleted or evidence_deleted or frame_deleted or person_deleted or alerts_expired:
         status = "completed_with_errors"
     else:
         status = "failed"
@@ -113,6 +115,7 @@ def remove_expired_private_data_for_session(
         expired_evidence_deleted=evidence_deleted,
         expired_frame_summaries_deleted=frame_deleted,
         expired_person_summaries_deleted=person_deleted,
+        expired_alerts=alerts_expired,
         failures=failures,
         failure_categories=tuple(failure_categories),
     )
@@ -264,6 +267,80 @@ def _remove_expired_person_summaries(
             "Expired person-summary deletion failed; records remain eligible for a later retention run.",
         )
         return 0
+
+
+def _expire_stale_alerts(
+    session: Session,
+    execution_time: datetime,
+    failure_categories: list[str],
+) -> int:
+    """Move an unresolved alert to `expired` once its review window has genuinely elapsed.
+
+    FR-ALERT-02 requires an `expired` state to actually be reachable, not just declared: an
+    alert still sitting in `open` or `acknowledged` -- never resolved by a human -- is
+    expired once it can no longer be meaningfully reviewed. For an alert whose evidence
+    generated successfully, that moment is its own `EvidenceSnapshot.expires_at` (the same
+    signal FR-ALERT-06 already enforces for evidence access). For one whose evidence never
+    became available (e.g. a privacy-gate failure), it is its own policy's
+    `evidence_retention_hours` window measured from when it was first observed -- the same
+    review window the evidence-retry endpoint already reasons about. An already-`resolved`
+    alert is never touched; the human safety intervention on it stands.
+    """
+    try:
+        candidates = session.scalars(
+            select(ComplianceAlert).where(ComplianceAlert.status.in_((AlertStatus.OPEN.value, AlertStatus.ACKNOWLEDGED.value)))
+        ).all()
+    except SQLAlchemyError:
+        logger.exception("Unable to select alerts for expiry.")
+        failure_categories.append("alert_expiry_selection")
+        return 0
+
+    expired_count = 0
+    for alert in candidates:
+        try:
+            deadline = _alert_review_deadline(session, alert)
+        except SQLAlchemyError:
+            logger.exception("Unable to resolve an alert's review deadline.")
+            failure_categories.append("alert_expiry_selection")
+            continue
+        if deadline is None or deadline > execution_time:
+            continue
+        try:
+            alert.status = AlertStatus.EXPIRED.value
+            expired_count += 1
+            _record_item_outcome(
+                session,
+                "retention.alert_expired",
+                "compliance_alert",
+                alert.id,
+                "Safety alert's review window elapsed without human resolution; automatically expired.",
+            )
+        except SQLAlchemyError:
+            logger.exception("Alert expiry transition failed.")
+            failure_categories.append("alert_expiry_transition")
+    return expired_count
+
+
+def _alert_review_deadline(session: Session, alert: ComplianceAlert) -> datetime | None:
+    """Return the moment after which an unresolved alert can no longer be meaningfully reviewed."""
+    if alert.evidence_available:
+        snapshot = session.scalars(select(EvidenceSnapshot).where(EvidenceSnapshot.alert_id == alert.id)).one_or_none()
+        return _as_utc(snapshot.expires_at) if snapshot is not None else None
+    policy = session.get(ZonePolicy, alert.policy_id)
+    if policy is None:
+        return None
+    return _as_utc(alert.first_observed_at) + timedelta(hours=policy.evidence_retention_hours)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive datetime (e.g. read back from SQLite) as UTC; leave an aware one unchanged.
+
+    SQLite's `DateTime` round-trip drops tzinfo from a value the application wrote as
+    timezone-aware, even though it is always logically UTC. Every comparison against
+    `datetime.now(UTC)` here must go through this first, or it raises on SQLite while
+    silently working on PostgreSQL (mirrors `app/main.py`'s identical helper).
+    """
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 def _record_item_outcome(session: Session, event_type: str, entity_type: str, entity_id: str, detail: str) -> None:

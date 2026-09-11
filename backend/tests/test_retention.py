@@ -42,8 +42,9 @@ class _Session:
         frame_delete_fails: bool = False,
         person_rows: int = 0,
         person_delete_fails: bool = False,
+        stale_alerts: list[object] | None = None,
     ) -> None:
-        self._scalar_results = [_ScalarResult(jobs), _ScalarResult(evidence)]
+        self._scalar_results = [_ScalarResult(jobs), _ScalarResult(evidence), _ScalarResult(stale_alerts or [])]
         self.added: list[object] = []
         self.committed = False
         self.rolled_back = False
