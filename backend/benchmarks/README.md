@@ -27,6 +27,19 @@ python run_ppe_benchmark.py --repo-id melihuzunoglu/ppe-detection
 python run_ppe_benchmark.py --repo-id Hansung-Cho/yolov8-ppe-detection
 ```
 
+`run_roboflow_benchmark.py` scores the Roboflow-hosted `construction-site-safety/27` model
+the same way, against the same 300-image sample. It calls a live hosted inference API
+instead of running weights locally, so it needs a Roboflow API key rather than more Python
+dependencies:
+
+```bash
+cd backend
+. .venv/bin/activate
+set -a; source .env; set +a   # loads ROBOFLOW_API_KEY from backend/.env -- never commit this key
+cd benchmarks
+python run_roboflow_benchmark.py
+```
+
 Dated `.txt` files in this directory are raw output from a prior run, kept as evidence for
 the evaluation record — they are not regenerated automatically and will go stale as models
 or the dataset change. Re-run the script and add a new dated file rather than editing an
@@ -41,5 +54,11 @@ existing one.
   Renewi's high-mounted, wide-angle CCTV specifically; that requires real site footage.
 - `--repo-id` only accepts candidates registered in `CANDIDATES` in the script. Add an entry
   there (repo id, weights filename, raw-label-to-normalized-label map) to benchmark another
-  Hugging-Face-hosted candidate. A Roboflow-hosted candidate needs a different adapter (an
-  HTTP call, not `hf_hub_download`+`YOLO`) — not implemented here.
+  Hugging-Face-hosted candidate.
+- The Roboflow hosted API infers at a fixed internal resolution (640×640 for this model) and
+  returns coordinates in that space; `run_roboflow_benchmark.py` rescales them back to each
+  image's original pixel dimensions before IoU matching. Its reported latency is a network
+  round trip, not comparable to the two locally-run candidates' CPU inference time. The
+  Roboflow API also requires an explicit `Content-Type: application/x-www-form-urlencoded`
+  header on the request body -- `requests` does not set this automatically for raw bytes the
+  way `curl -d` does, and the API returns an otherwise-unhelpful 400 without it.

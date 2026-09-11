@@ -1,0 +1,23 @@
+Candidate: Roboflow construction-site-safety/27 (hosted API)
+
+Sampled 300 of 1974 eligible held-out test images
+Random seed: 20260909  IoU threshold: 0.5  Confidence threshold: 0.25
+
+Per-class results:
+  helmet       TP= 351 FP= 206 FN= 321 precision=0.63 recall=0.522 f1=0.571 mean_TP_confidence=0.841 mean_FP_confidence=0.782
+  no_helmet    TP=   6 FP= 151 FN= 142 precision=0.038 recall=0.041 f1=0.039 mean_TP_confidence=0.741 mean_FP_confidence=0.732
+
+Total raw detections: 2462
+Unmapped-label detections (preserved as unknown_label, excluded from compliance calc): 547
+Detections below the 0.25 confidence threshold (excluded before matching): 0
+Latency: mean=1161.1ms  min=668.9ms  max=4398.7ms  (hosted API call, single image per request)
+
+Representative failure-case filenames (false positive or missed detection present):
+  RPReplay_Final1667001201_MP4-263_jpg.rf.d288e173607052ddacfae77557f96a4b.jpg
+  ppe_0686_jpg.rf.fa92c2a9051846e95f88fcc36cf82f27.jpg
+  RTX7CCFN_jpg.rf.1ae9136e785a092a87c3692f325b516e.jpg
+  -2437-_png_jpg.rf.626b82da5cd1b4d1a6eebb5ec8683c65.jpg
+  IMG_9950-1-_mp4-77_jpg.rf.4d12c4583c89ddfabd73fa48258cef49.jpg
+  TB2R28UvUOWBKNjSZKzXXXfWFXa_-1116877752_jpg.rf.4652f750833f204c8d5721c598de6b62.jpg
+  MX_img_107_jpg.rf.6dca56ab417587cbd5fc693664364449.jpg
+  -2185-_png_jpg.rf.7050cc17563d7306208ba104f85ef9e2.jpg
