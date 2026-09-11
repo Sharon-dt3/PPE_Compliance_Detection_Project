@@ -117,6 +117,7 @@ Use the platform environment-management workflow for non-secret configuration. N
 | `PPE_RAW_MEDIA_RETENTION_HOURS` | `1` | Duration before a private raw upload expires. |
 | `PPE_FRAME_OBSERVATION_RETENTION_HOURS` | `24` | Duration before a persisted, non-identifying frame summary expires. |
 | `PPE_EVIDENCE_RETENTION_HOURS` | `48` | Default POC evidence setting; the active zone-policy version ultimately sets individual evidence expiry and is API-limited to 24–72 hours. |
+| `PPE_SHIFT_SCHEDULE_JSON` | `{"day": [6, 18], "night": [18, 6]}` | Shift-name to `[start_hour, end_hour)` UTC window map used to label each dashboard rollup for shift-scoped reporting (FR-RPT-01). A window may wrap past midnight. Administrator-editable at runtime via `GET`/`PATCH /api/v1/settings/reporting`; a job completed outside every configured window is labelled `"unspecified"`. |
 
 ## Starting scheduled cleanup
 

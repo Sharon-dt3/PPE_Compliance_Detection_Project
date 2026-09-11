@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     hf_model_filename: str = "best.pt"
     local_model_path: str = ""
     detection_confidence_threshold: float = 0.25
+    shift_schedule_json: str = '{"day": [6, 18], "night": [18, 6]}'
 
     face_detector_prototxt_path: str = ""
     face_detector_model_path: str = ""

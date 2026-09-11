@@ -33,7 +33,7 @@ from app.models import (
     PersonObservation,
     ZonePolicy,
 )
-from app.platform_settings import get_platform_settings
+from app.platform_settings import get_platform_settings, resolve_shift
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +202,7 @@ def _persist_outcome(
                 job_id=job.id,
                 source_id=job.source_id,
                 zone_id=job.zone_id,
+                shift=resolve_shift(now, get_platform_settings(session).shift_schedule_json),
                 observed=decision.compliant_count + decision.non_compliant_count,
                 compliant=decision.compliant_count,
                 non_compliant=decision.non_compliant_count,

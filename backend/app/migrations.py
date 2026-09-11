@@ -36,6 +36,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260910_policy_effective_window", _upgrade_policy_effective_window),
         ("20260910_test_media_retention", _upgrade_test_media_retention),
         ("20260911_evidence_blurred_constraint", _upgrade_evidence_blurred_constraint),
+        ("20260912_shift_schedule", _upgrade_shift_schedule),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -160,7 +161,15 @@ def _upgrade_person_observations(connection: Connection) -> None:
 
 
 def _upgrade_platform_settings(connection: Connection) -> None:
-    """Create the singleton administrator-configurable retention/inference settings row."""
+    """Create the singleton administrator-configurable retention/inference settings row.
+
+    The seed INSERT below is raw SQL, so it must explicitly list every NOT-NULL column the
+    table has *at the moment this runs* -- including one added to the model after this
+    migration was written (``shift_schedule_json``), if the table was actually created by
+    ``Base.metadata.create_all()`` on a genuinely fresh install rather than by this
+    function's own DDL. That DDL never includes the column (it is added later by
+    ``_upgrade_shift_schedule``), so the two paths need different column lists.
+    """
     connection.execute(
         text(
             "CREATE TABLE IF NOT EXISTS platform_settings ("
@@ -176,25 +185,38 @@ def _upgrade_platform_settings(connection: Connection) -> None:
             "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)"
         )
     )
+    has_shift_schedule_column = "shift_schedule_json" in {
+        column["name"] for column in inspect(connection).get_columns("platform_settings")
+    }
+    columns = (
+        "id, raw_media_retention_hours, frame_observation_retention_hours, detection_provider, "
+        "demo_mode, hf_model_repository, hf_model_filename, local_model_path, detection_confidence_threshold"
+    )
+    values = (
+        "'default', :raw_media_retention_hours, :frame_observation_retention_hours, :detection_provider, "
+        ":demo_mode, :hf_model_repository, :hf_model_filename, :local_model_path, :detection_confidence_threshold"
+    )
+    params = {
+        "raw_media_retention_hours": settings.raw_media_retention_hours,
+        "frame_observation_retention_hours": settings.frame_observation_retention_hours,
+        "detection_provider": settings.detection_provider,
+        "demo_mode": settings.demo_mode,
+        "hf_model_repository": settings.hf_model_repository,
+        "hf_model_filename": settings.hf_model_filename,
+        "local_model_path": settings.local_model_path,
+        "detection_confidence_threshold": settings.detection_confidence_threshold,
+    }
+    if has_shift_schedule_column:
+        columns += ", shift_schedule_json"
+        values += ", :shift_schedule_json"
+        params["shift_schedule_json"] = settings.shift_schedule_json
+
     connection.execute(
         text(
-            "INSERT INTO platform_settings ("
-            "id, raw_media_retention_hours, frame_observation_retention_hours, detection_provider, "
-            "demo_mode, hf_model_repository, hf_model_filename, local_model_path, detection_confidence_threshold"
-            ") SELECT 'default', :raw_media_retention_hours, :frame_observation_retention_hours, :detection_provider, "
-            ":demo_mode, :hf_model_repository, :hf_model_filename, :local_model_path, :detection_confidence_threshold "
+            f"INSERT INTO platform_settings ({columns}) SELECT {values} "
             "WHERE NOT EXISTS (SELECT 1 FROM platform_settings WHERE id = 'default')"
         ),
-        {
-            "raw_media_retention_hours": settings.raw_media_retention_hours,
-            "frame_observation_retention_hours": settings.frame_observation_retention_hours,
-            "detection_provider": settings.detection_provider,
-            "demo_mode": settings.demo_mode,
-            "hf_model_repository": settings.hf_model_repository,
-            "hf_model_filename": settings.hf_model_filename,
-            "local_model_path": settings.local_model_path,
-            "detection_confidence_threshold": settings.detection_confidence_threshold,
-        },
+        params,
     )
 
 
@@ -212,6 +234,21 @@ def _upgrade_class_and_source_thresholds(connection: Connection) -> None:
 def _upgrade_sampling_fps(connection: Connection) -> None:
     """Add the optional per-policy video detector sampling rate."""
     _add_missing_columns(connection, "zone_policies", {"sampling_fps": "FLOAT"})
+
+
+def _upgrade_shift_schedule(connection: Connection) -> None:
+    """Add the administrator-configurable shift-name/UTC-hour-window schedule (FR-RPT-01).
+
+    Before this, ``MetricRollup.shift`` was always its schema default (``"unspecified"``) --
+    nothing ever computed a real shift label, so shift-scoped reporting/filtering/export was
+    wired up end to end but functionally dead. This column holds the schedule
+    ``resolve_shift()`` reads to actually assign one at rollup time.
+    """
+    _add_missing_columns(
+        connection,
+        "platform_settings",
+        {"shift_schedule_json": "TEXT DEFAULT '{\"day\": [6, 18], \"night\": [18, 6]}' NOT NULL"},
+    )
 
 
 def _upgrade_event_rule_results(connection: Connection) -> None:

@@ -75,6 +75,60 @@ def test_inference_settings_round_trip_and_role_enforcement() -> None:
         assert rejected.status_code == 422
 
 
+def test_reporting_settings_round_trip_and_role_enforcement() -> None:
+    """Administrators can change the shift schedule; other roles have read-only or no access.
+
+    Does not assert an exact baseline value: PlatformSettings is a real singleton row in a
+    shared, persistent test database (see conftest.py), so another test's earlier PATCH may
+    already have changed it -- this test only needs the round trip to work correctly from
+    whatever the current value is.
+    """
+    with TestClient(app) as client:
+        forbidden = client.get("/api/v1/settings/reporting", headers=_demo_headers("safety_supervisor"))
+        assert forbidden.status_code == 403
+
+        baseline = client.get("/api/v1/settings/reporting", headers=_demo_headers("administrator"))
+        assert baseline.status_code == 200
+        assert isinstance(baseline.json()["shift_schedule"], dict)
+
+        updated = client.patch(
+            "/api/v1/settings/reporting",
+            headers=_demo_headers("administrator"),
+            json={"shift_schedule": {"morning": [6, 14], "evening": [14, 22], "overnight": [22, 6]}},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["shift_schedule"] == {"morning": [6, 14], "evening": [14, 22], "overnight": [22, 6]}
+
+        hse_view = client.get("/api/v1/settings/reporting", headers=_demo_headers("hse_manager"))
+        assert hse_view.status_code == 200
+        assert hse_view.json()["shift_schedule"]["morning"] == [6, 14]
+
+        denied_write = client.patch(
+            "/api/v1/settings/reporting",
+            headers=_demo_headers("hse_manager"),
+            json={"shift_schedule": {"day": [0, 24]}},
+        )
+        assert denied_write.status_code == 403
+
+
+def test_reporting_settings_rejects_a_malformed_shift_window() -> None:
+    """A window outside 0-23 or with the wrong shape is rejected before it reaches storage."""
+    with TestClient(app) as client:
+        rejected = client.patch(
+            "/api/v1/settings/reporting",
+            headers=_demo_headers("administrator"),
+            json={"shift_schedule": {"day": [6, 24]}},
+        )
+        assert rejected.status_code == 422
+
+        rejected_shape = client.patch(
+            "/api/v1/settings/reporting",
+            headers=_demo_headers("administrator"),
+            json={"shift_schedule": {"day": [6]}},
+        )
+        assert rejected_shape.status_code == 422
+
+
 def test_evidence_demo_approval_gates_demonstration_viewer_access() -> None:
     """The demonstration-viewer role sees evidence only after explicit reviewer approval."""
     with TestClient(app) as client:

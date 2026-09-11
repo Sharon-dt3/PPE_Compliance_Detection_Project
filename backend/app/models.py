@@ -280,6 +280,7 @@ class PlatformSettings(Base):
     hf_model_filename: Mapped[str] = mapped_column(String(200), nullable=False)
     local_model_path: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     detection_confidence_threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    shift_schedule_json: Mapped[str] = mapped_column(Text, nullable=False, default='{"day": [6, 18], "night": [18, 6]}')
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

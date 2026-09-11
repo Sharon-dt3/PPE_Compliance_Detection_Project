@@ -400,6 +400,38 @@ class InferenceSettingsUpdateRequest(BaseModel):
     detection_confidence_threshold: float | None = Field(default=None, ge=0, le=1)
 
 
+class ReportingSettingsResponse(BaseModel):
+    """Current administrator-configurable shift schedule used to label dashboard rollups."""
+
+    shift_schedule: dict[str, list[int]]
+    updated_at: datetime
+
+
+class ReportingSettingsUpdateRequest(BaseModel):
+    """Administrator changes to the shift-name/UTC-hour-window schedule (FR-RPT-01).
+
+    Each value is a ``[start_hour, end_hour)`` pair on a 24-hour UTC clock; a window may
+    wrap past midnight (e.g. ``[18, 6]`` for a night shift). A media job completed outside
+    every configured window is labelled ``"unspecified"``, same as an empty schedule.
+    """
+
+    shift_schedule: dict[str, list[int]] | None = Field(
+        default=None,
+        description="Optional shift-name to [start_hour, end_hour) UTC window map, e.g. {\"day\": [6, 18], \"night\": [18, 6]}.",
+    )
+
+    @field_validator("shift_schedule")
+    @classmethod
+    def _validate_shift_schedule(cls, value: dict[str, list[int]] | None) -> dict[str, list[int]] | None:
+        """Reject a malformed window before it reaches storage."""
+        if value is None:
+            return value
+        for name, window in value.items():
+            if len(window) != 2 or not all(isinstance(hour, int) and 0 <= hour < 24 for hour in window):
+                raise ValueError(f"Shift '{name}' must be a [start_hour, end_hour) pair with each hour in 0-23.")
+        return value
+
+
 class AuditEventResponse(BaseModel):
     """Restricted, non-identifying operational audit event representation."""
 
@@ -704,6 +736,53 @@ def update_inference_settings(
         record_actor_audit_event(session, "configuration.inference_updated", "platform_settings", config.id, actor, "; ".join(changes))
     session.commit()
     return _inference_settings_response(config)
+
+
+@app.get(
+    "/api/v1/settings/reporting",
+    response_model=ReportingSettingsResponse,
+    tags=["Administration"],
+    summary="Get reporting shift schedule",
+)
+# PUBLIC_INTERFACE
+def get_reporting_settings(
+    session: Session = Depends(get_session),
+    _: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR, Role.HSE_MANAGER, Role.GOVERNANCE_REVIEWER)),
+) -> ReportingSettingsResponse:
+    """Return the active shift schedule used to label dashboard rollups."""
+    config = get_platform_settings(session)
+    session.commit()
+    return _reporting_settings_response(config)
+
+
+@app.patch(
+    "/api/v1/settings/reporting",
+    response_model=ReportingSettingsResponse,
+    tags=["Administration"],
+    summary="Update reporting shift schedule",
+)
+# PUBLIC_INTERFACE
+def update_reporting_settings(
+    request: ReportingSettingsUpdateRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> ReportingSettingsResponse:
+    """Update the shift schedule at runtime without a redeploy, fully audited.
+
+    Takes effect for media jobs completed after this change; already-persisted rollups keep
+    whichever shift label (or "unspecified") they were assigned at the time.
+    """
+    config = get_platform_settings(session)
+    if request.shift_schedule is not None:
+        new_json = json.dumps(request.shift_schedule)
+        if new_json != config.shift_schedule_json:
+            config.shift_schedule_json = new_json
+            config.updated_at = datetime.now(UTC)
+            record_actor_audit_event(
+                session, "configuration.reporting_updated", "platform_settings", config.id, actor, f"shift_schedule={new_json}"
+            )
+    session.commit()
+    return _reporting_settings_response(config)
 
 
 @app.get("/api/v1/zones", response_model=list[ZoneResponse], tags=["Configuration"], summary="List safety zones")
@@ -1637,6 +1716,14 @@ def _inference_settings_response(config: PlatformSettings) -> InferenceSettingsR
         hf_model_filename=config.hf_model_filename,
         local_model_path=config.local_model_path,
         detection_confidence_threshold=config.detection_confidence_threshold,
+        updated_at=config.updated_at,
+    )
+
+
+def _reporting_settings_response(config: PlatformSettings) -> ReportingSettingsResponse:
+    """Convert the singleton settings row to its reporting-facing representation."""
+    return ReportingSettingsResponse(
+        shift_schedule=json.loads(config.shift_schedule_json or "{}"),
         updated_at=config.updated_at,
     )
 
