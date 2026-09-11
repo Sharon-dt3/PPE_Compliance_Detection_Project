@@ -208,7 +208,7 @@ class EvidenceSnapshot(Base):
     """Private face-blurred evidence associated with a single reviewable alert."""
 
     __tablename__ = "evidence_snapshots"
-    __table_args__ = (CheckConstraint("blurred = 1", name="ck_evidence_snapshot_blurred_true"),)
+    __table_args__ = (CheckConstraint("blurred = true", name="ck_evidence_snapshot_blurred_true"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     alert_id: Mapped[str] = mapped_column(ForeignKey("compliance_alerts.id"), nullable=False, unique=True, index=True)

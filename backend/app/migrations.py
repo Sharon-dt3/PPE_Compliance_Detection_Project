@@ -119,7 +119,7 @@ def _upgrade_frame_observation_expiry(connection: Connection) -> None:
     connection.execute(
         text(
             "UPDATE frame_observations "
-            "SET expires_at = datetime(created_at, '+24 hours') "
+            "SET expires_at = created_at + interval '24 hours' "
             "WHERE expires_at IS NULL"
         )
     )
