@@ -25,6 +25,30 @@ evidence generation) are not committed without a licence trail: see
 [`backend/models/face_detector/README.md`](../backend/models/face_detector/README.md) for
 their upstream source, licence, and a checksum verified against OpenCV's own manifest.
 
+## Worker timeout and controlled retry
+
+`PPE_MEDIA_JOB_SOFT_TIME_LIMIT_SECONDS` (default `240`) and `PPE_MEDIA_JOB_TIME_LIMIT_SECONDS`
+(default `300`) bound how long one media job may run in the Celery worker — Technology
+Decision 1's required "worker timeout and retry policy" configuration item.
+
+- **Soft limit reached:** Celery raises `SoftTimeLimitExceeded` inside `process_media_job`,
+  which is caught like any other processing failure: the job is marked `failed` with a
+  clear timeout message, fully auditable and safe.
+- **Hard limit reached:** Celery force-kills the worker process outright. No Python code
+  runs to update the job's status, so it can be left stuck `processing` indefinitely. This
+  is a known Celery limitation, not something this POC's task code can prevent from inside
+  itself. If a job appears stuck `processing` well past the configured hard limit,
+  investigate the worker (it likely restarted) and update the job's status directly before
+  considering `POST /api/v1/media-jobs/{jobId}/retry` (which requires `failed`, not
+  `processing`).
+
+`POST /api/v1/media-jobs/{jobId}/retry` (supervisor or administrator) is the controlled-retry
+mechanism itself: it re-queues a `failed` job for full reprocessing — including evidence
+generation — so that fixing a misconfigured face-detector model or other correctable fault
+lets the *same* private media be reprocessed rather than requiring a fresh upload. It is
+refused once the job's raw private media has already been deleted by scheduled retention
+(there is nothing left to reprocess), and refused for any job not currently `failed`.
+
 ## Policy effective time window
 
 A zone policy version may optionally carry `effective_start` and `effective_end` UTC

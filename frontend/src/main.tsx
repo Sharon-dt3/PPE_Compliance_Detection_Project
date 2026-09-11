@@ -962,7 +962,7 @@ function App() {
         {jobs.length === 0 ? <EmptyState title="No media jobs" text="Create a private processing job to demonstrate the upload-to-review workflow." /> : <div className="jobs">
           {jobs.map((job) => <article className="job" key={job.id}>
             <div><Status status={job.status} /><h3>{job.filename}</h3><p>{formatDate(job.submitted_at)} · Compliant: {job.compliant_count} · Non-compliant: {job.non_compliant_count} · Unknown: {job.unknown_count}</p><p className="muted">{job.message}</p></div>
-            <div className="button-row"><button className="secondary-button" type="button" onClick={() => void openJob(job)}>View summary</button>{["queued", "validating", "processing"].includes(job.status) && <button type="button" onClick={() => void cancelJob(role, job, loadForRole, setNotice, setLoading)}>Cancel</button>}</div>
+            <div className="button-row"><button className="secondary-button" type="button" onClick={() => void openJob(job)}>View summary</button>{["queued", "validating", "processing"].includes(job.status) && <button type="button" onClick={() => void cancelJob(role, job, loadForRole, setNotice, setLoading)}>Cancel</button>}{job.status === "failed" && <button type="button" onClick={() => void retryJob(role, job, loadForRole, setNotice, setLoading)}>Retry</button>}</div>
           </article>)}
         </div>}
       </section>
@@ -1262,6 +1262,25 @@ const cancelJob = async (
     await refresh(role);
   } catch (error) {
     setNotice(error instanceof Error ? error.message : "Unable to cancel the pending media job.");
+  } finally {
+    setLoading(false);
+  }
+};
+
+const retryJob = async (
+  role: Role,
+  job: Job,
+  refresh: (activeRole: Role) => Promise<void>,
+  setNotice: (value: string) => void,
+  setLoading: (value: boolean) => void,
+) => {
+  setLoading(true);
+  try {
+    await request<Job>(role, `/api/v1/media-jobs/${job.id}/retry`, { method: "POST" });
+    setNotice("Failed media job re-queued for retry.");
+    await refresh(role);
+  } catch (error) {
+    setNotice(error instanceof Error ? error.message : "Unable to retry this media job.");
   } finally {
     setLoading(false);
   }

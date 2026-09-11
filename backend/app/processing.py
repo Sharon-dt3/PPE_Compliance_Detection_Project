@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Protocol
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -125,6 +126,13 @@ def process_media_job(job_id: str, *, repository_factory: Callable[[Session], Jo
                 _persist_outcome(session, job, effective_policy, detections, decision, media_path)
                 session.commit()
                 logger.info("Media job processing completed.")
+            except SoftTimeLimitExceeded:
+                logger.exception("Media job processing timed out and was failed safely.")
+                repository.mark_failed(
+                    job,
+                    "Processing timed out safely before completion. Retry once the underlying cause "
+                    "(for example, an oversized or unusually slow-to-decode file) has been addressed.",
+                )
             except Exception:
                 logger.exception("Media job processing failed safely.")
                 repository.mark_failed(

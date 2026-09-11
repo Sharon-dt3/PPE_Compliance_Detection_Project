@@ -19,3 +19,7 @@ _TEST_STATE_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("PPE_DATABASE_URL", f"sqlite:///{_TEST_STATE_ROOT / 'test.db'}")
 os.environ.setdefault("PPE_PRIVATE_MEDIA_DIRECTORY", str(_TEST_STATE_ROOT / "private-media"))
 os.environ.setdefault("PPE_PRIVATE_EVIDENCE_DIRECTORY", str(_TEST_STATE_ROOT / "private-evidence"))
+
+# The suite authenticates via the X-Demo-Role header regardless of the developer's local
+# .env (e.g. after connecting a real Supabase project, which sets PPE_AUTH_MODE=supabase).
+os.environ.setdefault("PPE_AUTH_MODE", "demo")

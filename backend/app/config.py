@@ -45,6 +45,15 @@ class Settings(BaseSettings):
     face_blur_padding_ratio: float = 0.15
     face_blur_kernel_size: int = 31
 
+    # Worker timeout and retry policy (Technology Decision 1's required configuration item).
+    # soft_time_limit raises a catchable SoftTimeLimitExceeded inside process_media_job so
+    # the job can still be marked FAILED safely; time_limit is a hard backstop that force-
+    # kills the worker process if even that cleanup hangs (documented in OPERATIONS.md as a
+    # known edge case: a hard-killed worker leaves the job stuck "processing" until an
+    # administrator investigates, since no Python code runs to update its status).
+    media_job_soft_time_limit_seconds: int = 240
+    media_job_time_limit_seconds: int = 300
+
     def resolve_jwks_url(self) -> str:
         """Return the configured or provider-derived JWKS endpoint, or an empty string."""
         if self.supabase_jwks_url:

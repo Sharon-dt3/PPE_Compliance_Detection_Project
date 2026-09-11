@@ -1033,6 +1033,50 @@ def cancel_media_job(
 
 
 @app.post(
+    "/api/v1/media-jobs/{job_id}/retry",
+    response_model=MediaJobResponse,
+    tags=["Media jobs"],
+    summary="Retry a failed media job",
+)
+# PUBLIC_INTERFACE
+def retry_media_job(
+    job_id: str,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.ADMINISTRATOR)),
+) -> MediaJobResponse:
+    """Re-queue a failed job for full reprocessing, including evidence generation.
+
+    This is the controlled-retry mechanism the mandatory face-blur privacy gate requires:
+    if evidence generation failed because the detector was misconfigured, unavailable, or
+    processing otherwise failed safely, fixing the underlying cause and retrying here
+    reprocesses the same private media end-to-end rather than requiring a fresh upload.
+    Only available while the job's raw private media has not yet been deleted by
+    scheduled retention -- a job whose raw media already expired cannot be retried, since
+    there is nothing left to reprocess.
+    """
+    job = _get_job_or_404(session, job_id)
+    if job.status != JobStatus.FAILED.value:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only a failed job may be retried.")
+    if job.storage_key.startswith("expired-"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The raw private media for this job has already been deleted and can no longer be retried.",
+        )
+    job.status = JobStatus.QUEUED.value
+    job.message = "Re-queued for retry after a prior processing failure."
+    job.failure_code = None
+    record_actor_audit_event(session, "media_job.retry_requested", "media_job", job.id, actor, "Job re-queued for retry.")
+    session.commit()
+    try:
+        process_media_job_task.delay(job.id)
+    except Exception:
+        job.message = "Re-queued safely. The worker is currently unavailable; processing will resume when it is restored."
+        session.commit()
+    session.refresh(job)
+    return _job_response(job)
+
+
+@app.post(
     "/api/v1/media-jobs/{job_id}/approve-test-retention",
     response_model=MediaJobResponse,
     tags=["Media jobs"],

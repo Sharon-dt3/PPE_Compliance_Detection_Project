@@ -23,9 +23,19 @@ celery_app.conf.update(
 )
 
 
-@celery_app.task(name="ppe.process_media_job")
+@celery_app.task(
+    name="ppe.process_media_job",
+    soft_time_limit=settings.media_job_soft_time_limit_seconds,
+    time_limit=settings.media_job_time_limit_seconds,
+)
 def process_media_job_task(job_id: str) -> None:
-    """Process one persisted job in the background worker."""
+    """Process one persisted job in the background worker.
+
+    ``soft_time_limit`` gives ``process_media_job`` a chance to mark the job FAILED safely
+    (it catches ``SoftTimeLimitExceeded`` like any other exception); ``time_limit`` is a
+    hard backstop that force-kills the worker process if that cleanup itself hangs -- see
+    OPERATIONS.md for the resulting known edge case.
+    """
     from app.processing import process_media_job
 
     process_media_job(job_id)
