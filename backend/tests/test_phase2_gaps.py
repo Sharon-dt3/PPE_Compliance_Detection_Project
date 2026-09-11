@@ -97,6 +97,134 @@ def test_policy_without_effective_window_still_defaults_to_none() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Gap 1b: the effective window is enforced when resolving a zone's governing policy,
+# not only recorded -- previously effective_start/effective_end were persisted and
+# validated but nothing checked them when selecting which policy governs a zone.
+# ---------------------------------------------------------------------------
+
+
+def _valid_jpeg_bytes() -> bytes:
+    """Return a genuinely decodable minimal JPEG, not just signature bytes.
+
+    Media validation actually decodes the image content (not only its magic bytes), so a
+    positive "this upload should succeed" test needs real, decodable JPEG data.
+    """
+    import cv2
+    import numpy as np
+
+    success, encoded = cv2.imencode(".jpg", np.zeros((16, 16, 3), dtype=np.uint8))
+    assert success
+    return encoded.tobytes()
+
+
+def test_zone_with_future_effective_start_is_not_yet_governing() -> None:
+    """A policy scheduled to start in the future does not govern the zone or new jobs yet."""
+    admin = _demo_headers("administrator")
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/zones", headers=admin, json={"name": f"Future window zone {uuid4()}", "description": "test"}
+        )
+        zone_id = created.json()["id"]
+        source = client.post(
+            "/api/v1/sources", headers=admin, json={"name": f"Future window source {uuid4()}", "zone_id": zone_id}
+        )
+        source_id = source.json()["id"]
+
+        future_start = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+        patched = client.patch(
+            f"/api/v1/zones/{zone_id}/policy", headers=admin, json={"active": True, "effective_start": future_start}
+        )
+        assert patched.status_code == 200
+
+        listed = client.get("/api/v1/zones", headers=admin)
+        assert all(item["id"] != zone_id for item in listed.json())
+
+        upload = client.post(
+            "/api/v1/media-jobs",
+            headers=admin,
+            params={"source_id": source_id},
+            files={"file": ("clip.jpg", _valid_jpeg_bytes(), "image/jpeg")},
+        )
+        assert upload.status_code == http_status.HTTP_409_CONFLICT
+
+
+def test_zone_with_lapsed_effective_end_is_no_longer_governing() -> None:
+    """A policy whose effective_end has already passed no longer governs the zone or new jobs."""
+    admin = _demo_headers("administrator")
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/zones", headers=admin, json={"name": f"Lapsed window zone {uuid4()}", "description": "test"}
+        )
+        zone_id = created.json()["id"]
+        source = client.post(
+            "/api/v1/sources", headers=admin, json={"name": f"Lapsed window source {uuid4()}", "zone_id": zone_id}
+        )
+        source_id = source.json()["id"]
+
+        past_start = (datetime.now(UTC) - timedelta(days=60)).isoformat()
+        past_end = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        patched = client.patch(
+            f"/api/v1/zones/{zone_id}/policy",
+            headers=admin,
+            json={"active": True, "effective_start": past_start, "effective_end": past_end},
+        )
+        assert patched.status_code == 200
+
+        listed = client.get("/api/v1/zones", headers=admin)
+        assert all(item["id"] != zone_id for item in listed.json())
+
+        upload = client.post(
+            "/api/v1/media-jobs",
+            headers=admin,
+            params={"source_id": source_id},
+            files={"file": ("clip.jpg", _valid_jpeg_bytes(), "image/jpeg")},
+        )
+        assert upload.status_code == http_status.HTTP_409_CONFLICT
+
+
+def test_zone_with_policy_inside_its_window_is_governing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A policy whose window currently covers now governs the zone and accepts new jobs.
+
+    Isolated from settings.max_concurrent_jobs: other tests in this module intentionally
+    leave permanently-queued jobs behind (no worker ever runs in this suite to complete
+    them), so the shared test database accumulates in-flight jobs across runs. This test
+    is about the effective-window resolution, not the concurrency cap, so it neutralizes
+    that cap rather than being incidentally broken by unrelated leftover state.
+    """
+    monkeypatch.setattr(settings, "max_concurrent_jobs", 10_000)
+    admin = _demo_headers("administrator")
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/zones", headers=admin, json={"name": f"Current window zone {uuid4()}", "description": "test"}
+        )
+        zone_id = created.json()["id"]
+        source = client.post(
+            "/api/v1/sources", headers=admin, json={"name": f"Current window source {uuid4()}", "zone_id": zone_id}
+        )
+        source_id = source.json()["id"]
+
+        window_start = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+        window_end = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+        patched = client.patch(
+            f"/api/v1/zones/{zone_id}/policy",
+            headers=admin,
+            json={"active": True, "effective_start": window_start, "effective_end": window_end},
+        )
+        assert patched.status_code == 200
+
+        listed = client.get("/api/v1/zones", headers=admin)
+        assert any(item["id"] == zone_id for item in listed.json())
+
+        upload = client.post(
+            "/api/v1/media-jobs",
+            headers=admin,
+            params={"source_id": source_id},
+            files={"file": ("clip.jpg", _valid_jpeg_bytes(), "image/jpeg")},
+        )
+        assert upload.status_code == http_status.HTTP_201_CREATED
+
+
+# ---------------------------------------------------------------------------
 # Gap 2: Explicit maximum video-FPS validation
 # ---------------------------------------------------------------------------
 

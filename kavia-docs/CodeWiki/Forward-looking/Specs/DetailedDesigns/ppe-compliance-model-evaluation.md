@@ -8,6 +8,15 @@ This record satisfies the Phase 5 roadmap's model-selection, licensing, and eval
 requirements: a licence trail for every candidate model, a documented benchmark (not a single
 headline accuracy figure), and the production route the POC does not yet ship.
 
+## Other bundled model: face-detector privacy gate
+
+This register also covers the mandatory OpenCV DNN face-detector model used by the evidence
+privacy gate (Technology Decision §1) — a different concern from PPE detection below, but
+still a model artifact requiring the same source/licence/checksum trail. See
+[`backend/models/face_detector/README.md`](../../../../../backend/models/face_detector/README.md)
+for the full record: source (`opencv/opencv`, Apache License 2.0), and a checksum verified
+against OpenCV's own published manifest.
+
 ## Candidate registry
 
 | Candidate | Role | Framework | Weights licence | Training data | Access |

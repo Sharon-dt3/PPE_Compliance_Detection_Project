@@ -19,15 +19,30 @@ This check never blocks the application from starting: a `not_configured` or
 `unavailable` result only means evidence generation will fail closed (Phase 7), consistent
 with `create_annotated_blurred_evidence` never producing an unblurred image.
 
+The model files bundled at `backend/models/face_detector/` (point
+`PPE_FACE_DETECTOR_PROTOTXT_PATH` / `PPE_FACE_DETECTOR_MODEL_PATH` at them to enable
+evidence generation) are not committed without a licence trail: see
+[`backend/models/face_detector/README.md`](../backend/models/face_detector/README.md) for
+their upstream source, licence, and a checksum verified against OpenCV's own manifest.
+
 ## Policy effective time window
 
 A zone policy version may optionally carry `effective_start` and `effective_end` UTC
 timestamps via `PATCH /api/v1/zones/{zone_id}/policy`. Both are optional; when unset, the
 policy version is effective for as long as it remains `active`. When both are supplied,
 `effective_end` must be strictly after `effective_start` or the request is rejected with a
-422 response. These fields are persisted and returned for administrator review; selecting
-among multiple time-scoped policy versions at evaluation time is a separate, not-yet-wired
-capability.
+422 response.
+
+The window is enforced, not only recorded: `GET /api/v1/zones` and `POST /api/v1/media-jobs`
+both resolve a zone's governing policy through `_currently_effective_policy`, which treats
+the `active` policy as unusable outside its own `effective_start`/`effective_end` window.
+This lets an administrator stage a future policy change in advance (create it `active` with
+a future `effective_start`) without it governing zone display or new jobs early, and lets a
+policy intentionally lapse at `effective_end` without a manual follow-up deactivation. When
+the `active` policy is outside its window, the zone is treated exactly as if it had no
+active policy at all: it is omitted from `GET /api/v1/zones`, and a new upload against one
+of its sources is rejected with `409 Conflict` ("The selected source has no active safety
+policy") until an operator activates a policy version that is currently in effect.
 
 ## Maximum video frame rate
 

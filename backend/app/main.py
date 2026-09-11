@@ -721,7 +721,7 @@ def list_zones(
     zones = session.scalars(select(Zone).where(Zone.enabled.is_(True)).order_by(Zone.name)).all()
     results: list[ZoneResponse] = []
     for zone in zones:
-        policy = session.scalar(select(ZonePolicy).where(ZonePolicy.zone_id == zone.id, ZonePolicy.active.is_(True)))
+        policy = _currently_effective_policy(session, zone.id)
         if policy is not None:
             results.append(_zone_response(zone, policy))
     return results
@@ -903,7 +903,7 @@ async def create_media_job(
     source = session.get(CameraSource, source_id)
     if source is None or not source.enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured camera source not found.")
-    policy = session.scalar(select(ZonePolicy).where(ZonePolicy.zone_id == source.zone_id, ZonePolicy.active.is_(True)))
+    policy = _currently_effective_policy(session, source.zone_id)
     if policy is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The selected source has no active safety policy.")
 
@@ -1442,17 +1442,43 @@ def _zone_response(zone: Zone, policy: ZonePolicy) -> ZoneResponse:
     return ZoneResponse(id=zone.id, name=zone.name, description=zone.description, policy=_policy_response(policy))
 
 
-def _evidence_missing_or_expired(snapshot: EvidenceSnapshot | None) -> bool:
-    """Return whether evidence is absent, unblurred, deleted, or past its retention expiry.
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive datetime (e.g. read back from SQLite) as UTC; leave an aware one unchanged.
 
-    Comparison is tolerant of SQLite's `DateTime` round-trip: a timezone-aware value the
-    application writes comes back without tzinfo on read, even though it is always logically
-    UTC. Treating a naive `expires_at` as UTC keeps this correct on SQLite and PostgreSQL alike.
+    SQLite's `DateTime` round-trip drops tzinfo from a value the application wrote as
+    timezone-aware, even though it is always logically UTC. Every comparison against
+    `datetime.now(UTC)` elsewhere in this module must go through this first, or it raises
+    on SQLite while silently working on PostgreSQL.
     """
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _evidence_missing_or_expired(snapshot: EvidenceSnapshot | None) -> bool:
+    """Return whether evidence is absent, unblurred, deleted, or past its retention expiry."""
     if snapshot is None or not snapshot.blurred or snapshot.deleted_at is not None:
         return True
-    expires_at = snapshot.expires_at if snapshot.expires_at.tzinfo else snapshot.expires_at.replace(tzinfo=UTC)
-    return expires_at <= datetime.now(UTC)
+    return _as_utc(snapshot.expires_at) <= datetime.now(UTC)
+
+
+def _currently_effective_policy(session: Session, zone_id: str, *, at: datetime | None = None) -> ZonePolicy | None:
+    """Return the zone's active policy version only if it is within its effective window.
+
+    A policy version can be flagged ``active`` ahead of or after its intended effective
+    window -- ``effective_start``/``effective_end`` let an administrator stage a future
+    policy change without it silently governing zone display or new jobs before its
+    intended start, or after it has intentionally lapsed. When no policy is currently
+    effective (even if one is flagged ``active``), this returns ``None`` exactly as if the
+    zone had no active policy at all: callers already handle that case safely.
+    """
+    now = at or datetime.now(UTC)
+    policy = session.scalar(select(ZonePolicy).where(ZonePolicy.zone_id == zone_id, ZonePolicy.active.is_(True)))
+    if policy is None:
+        return None
+    if policy.effective_start is not None and _as_utc(policy.effective_start) > now:
+        return None
+    if policy.effective_end is not None and _as_utc(policy.effective_end) < now:
+        return None
+    return policy
 
 
 def _user_response(user: ApplicationUser) -> ApplicationUserResponse:
