@@ -35,6 +35,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260910_event_acknowledgements", _upgrade_event_acknowledgements),
         ("20260910_policy_effective_window", _upgrade_policy_effective_window),
         ("20260910_test_media_retention", _upgrade_test_media_retention),
+        ("20260911_evidence_blurred_constraint", _upgrade_evidence_blurred_constraint),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -259,6 +260,50 @@ def _upgrade_test_media_retention(connection: Connection) -> None:
             "test_retention_approved": "BOOLEAN DEFAULT 0 NOT NULL",
         },
     )
+
+
+def _upgrade_evidence_blurred_constraint(connection: Connection) -> None:
+    """Enforce at the data layer that no evidence record may exist unblurred.
+
+    SQLite cannot add a CHECK constraint to an existing table with ALTER TABLE, so an
+    older local database is upgraded by rebuilding evidence_snapshots with the constraint
+    in place, keeping only the rows that were already compliant (every row created by this
+    application always sets blurred=True; this only guards against pre-constraint drift).
+    A freshly created database already has the constraint from the model metadata, so this
+    is a no-op there.
+    """
+    if connection.dialect.name != "sqlite":
+        return
+    existing_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'evidence_snapshots'")
+    ).scalar()
+    if existing_sql is None or "CHECK" in existing_sql.upper():
+        return
+
+    connection.execute(text("ALTER TABLE evidence_snapshots RENAME TO evidence_snapshots_pre_blur_constraint"))
+    connection.execute(
+        text(
+            "CREATE TABLE evidence_snapshots ("
+            "id VARCHAR(36) PRIMARY KEY, "
+            "alert_id VARCHAR(36) NOT NULL UNIQUE, "
+            "storage_key VARCHAR(255) NOT NULL UNIQUE, "
+            "blurred BOOLEAN NOT NULL, "
+            "expires_at TIMESTAMP NOT NULL, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+            "deleted_at TIMESTAMP, "
+            "demo_approved BOOLEAN DEFAULT 0 NOT NULL, "
+            "CHECK (blurred = 1))"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO evidence_snapshots "
+            "(id, alert_id, storage_key, blurred, expires_at, created_at, deleted_at, demo_approved) "
+            "SELECT id, alert_id, storage_key, blurred, expires_at, created_at, deleted_at, demo_approved "
+            "FROM evidence_snapshots_pre_blur_constraint WHERE blurred = 1"
+        )
+    )
+    connection.execute(text("DROP TABLE evidence_snapshots_pre_blur_constraint"))
 
 
 def _add_missing_columns(connection: Connection, table: str, additions: dict[str, str]) -> None:

@@ -61,8 +61,11 @@ cd backend
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+pip install --force-reinstall --no-deps opencv-python-headless==4.10.0.84
 uvicorn app.main:app --reload --port 8000
 ```
+
+The second `pip install` is required, not optional: `ultralytics` pulls in the full (non-headless) `opencv-python` as its own transitive dependency, which installs into the same `cv2` package as `opencv-python-headless` and silently overwrites it. Without this step `cv2.dnn.readNetFromCaffe` disappears (OpenCV 5.x removed the legacy `dnn` Caffe loader entirely), which breaks the mandatory face-blur privacy gate (Phase 7) with no import error -- evidence generation simply fails closed for every alert. Re-running this command after any `pip install`/`pip install -r requirements.txt` restores the pinned, headless-only build this project actually requires.
 
 Run the worker after Redis is available:
 

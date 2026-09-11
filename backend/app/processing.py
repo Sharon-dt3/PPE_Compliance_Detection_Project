@@ -314,13 +314,42 @@ def _create_or_update_alert(
         "Persistent non-identifying safety evidence confirmed.",
     )
 
+    evidence_objects = detections.frames[-1].objects if detections.frames else ()
+    attempt_evidence_generation(
+        session,
+        alert,
+        media_path,
+        evidence_objects,
+        requirement_decision.requirement,
+        policy.evidence_retention_hours,
+    )
+
+
+# PUBLIC_INTERFACE
+def attempt_evidence_generation(
+    session: Session,
+    alert: ComplianceAlert,
+    media_path: str,
+    evidence_objects: tuple[DetectedObject, ...],
+    requirement: str,
+    evidence_retention_hours: int,
+    *,
+    actor_reference: str = "processing-worker",
+    actor_role: str = "system",
+) -> bool:
+    """Run the mandatory fail-closed face-blur pipeline and persist evidence, or block safely.
+
+    Shared by normal media-job processing and the controlled evidence-retry endpoint (used
+    once the underlying fault -- for example, a misconfigured detector model -- has been
+    corrected): both paths must apply the exact same fail-closed sequence and never create
+    an accessible evidence object except from a successfully blurred frame.
+
+    Returns:
+        True only when face-blurred evidence was created; False when the mandatory privacy
+        gate did not complete, in which case the alert is left safely without evidence.
+    """
     try:
-        evidence_objects = detections.frames[-1].objects if detections.frames else ()
-        storage_key = EvidenceService().create_annotated_blurred_evidence(
-            media_path,
-            evidence_objects,
-            requirement_decision.requirement,
-        )
+        storage_key = EvidenceService().create_annotated_blurred_evidence(media_path, evidence_objects, requirement)
     except PrivacyProcessingError:
         alert.evidence_message = "Evidence is unavailable because mandatory privacy processing did not complete."
         record_audit_event(
@@ -328,18 +357,18 @@ def _create_or_update_alert(
             "evidence.blocked",
             "compliance_alert",
             alert.id,
-            "processing-worker",
-            "system",
+            actor_reference,
+            actor_role,
             "Mandatory face-blur gate did not complete.",
         )
-        return
+        return False
 
     session.add(
         EvidenceSnapshot(
             alert_id=alert.id,
             storage_key=storage_key,
             blurred=True,
-            expires_at=now + timedelta(hours=policy.evidence_retention_hours),
+            expires_at=datetime.now(UTC) + timedelta(hours=evidence_retention_hours),
         )
     )
     alert.evidence_available = True
@@ -349,10 +378,11 @@ def _create_or_update_alert(
         "evidence.created",
         "compliance_alert",
         alert.id,
-        "processing-worker",
-        "system",
+        actor_reference,
+        actor_role,
         "Face-blurred evidence created.",
     )
+    return True
 
 
 def _persist_frame_observations(

@@ -6,8 +6,8 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 
 class Base(DeclarativeBase):
@@ -208,6 +208,7 @@ class EvidenceSnapshot(Base):
     """Private face-blurred evidence associated with a single reviewable alert."""
 
     __tablename__ = "evidence_snapshots"
+    __table_args__ = (CheckConstraint("blurred = 1", name="ck_evidence_snapshot_blurred_true"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     alert_id: Mapped[str] = mapped_column(ForeignKey("compliance_alerts.id"), nullable=False, unique=True, index=True)
@@ -217,6 +218,13 @@ class EvidenceSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     demo_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    @validates("blurred")
+    def _reject_unblurred(self, _key: str, value: bool) -> bool:
+        """Refuse to construct an evidence record unless face-blurring already succeeded."""
+        if not value:
+            raise ValueError("An evidence snapshot may only be persisted after face-blurring succeeds.")
+        return value
 
 
 class MetricRollup(Base):

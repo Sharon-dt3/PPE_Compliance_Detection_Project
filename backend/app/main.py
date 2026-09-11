@@ -42,6 +42,7 @@ from app.models import (
     ZonePolicy,
 )
 from app.platform_settings import get_platform_settings
+from app.processing import attempt_evidence_generation
 from app.reporting import AggregateReportingService, ReportFilters
 from app.storage import PrivateMediaStorage
 from app.worker import process_media_job_task
@@ -1315,6 +1316,61 @@ def get_alert_evidence(
     record_actor_audit_event(session, "evidence.accessed", "evidence_snapshot", snapshot.id, actor, "Face-blurred evidence viewed.")
     session.commit()
     return Response(content=content, media_type="image/jpeg")
+
+
+@app.post(
+    "/api/v1/alerts/{alert_id}/evidence/retry",
+    response_model=AlertResponse,
+    tags=["Alerts"],
+    summary="Retry the mandatory face-blur evidence pipeline for one alert",
+)
+# PUBLIC_INTERFACE
+def retry_alert_evidence(
+    alert_id: str,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.ADMINISTRATOR)),
+) -> AlertResponse:
+    """Re-attempt the fail-closed face-blur pipeline after a privacy-gate fault is corrected.
+
+    A persistent non-compliance alert whose mandatory evidence generation previously failed
+    (for example, because the configured face-detector model was temporarily unavailable)
+    remains fully reviewable but with no accessible evidence image -- Technology Decision 1's
+    fail-closed behavior. This is the controlled-retry mechanism for that exact scenario: once
+    the underlying fault is fixed, it re-selects a frame from the alert's still-available raw
+    media and re-runs face detection and blurring, persisting evidence only on success and
+    never an unblurred frame. Refused once evidence already exists for this alert, and refused
+    once the raw media has already been deleted by scheduled retention (there is nothing left
+    to reprocess). The retried image carries no PPE/compliance annotation boxes, since
+    per-frame detection results are intentionally never persisted for data minimisation; it
+    still carries the safety-observation caption.
+    """
+    alert = _get_alert_or_404(session, alert_id)
+    if alert.evidence_available:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Evidence has already been generated for this alert.")
+    job = session.get(MediaJob, alert.job_id)
+    if job is None or job.storage_key.startswith("expired-"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The raw private media for this alert has already been deleted and evidence can no longer be generated.",
+        )
+    policy = session.get(ZonePolicy, alert.policy_id)
+    if policy is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The governing safety policy for this alert is unavailable.")
+
+    media_path = str(PrivateMediaStorage().root_path(job.storage_key))
+    attempt_evidence_generation(
+        session,
+        alert,
+        media_path,
+        (),
+        alert.failed_requirement,
+        policy.evidence_retention_hours,
+        actor_reference=actor.reference,
+        actor_role=actor.role.value,
+    )
+    session.commit()
+    session.refresh(alert)
+    return _alert_response(alert)
 
 
 @app.get("/api/v1/reports/compliance", response_model=ComplianceReport, tags=["Reports"], summary="Get aggregate compliance metrics")

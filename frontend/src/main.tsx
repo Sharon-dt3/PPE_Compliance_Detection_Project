@@ -864,6 +864,24 @@ function App() {
     }
   };
 
+  const retryAlertEvidence = async (alert: Alert) => {
+    if (!role) return;
+    setLoading(true);
+    try {
+      const updated = await request<Alert>(role, `/api/v1/alerts/${alert.id}/evidence/retry`, { method: "POST" });
+      setNotice(
+        updated.evidence_available
+          ? "Privacy-processed evidence generated successfully."
+          : "Evidence is still unavailable; mandatory privacy processing did not complete.",
+      );
+      await loadForRole(role);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to retry evidence generation for this alert.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const exportAggregate = async () => {
     if (!role) return;
     setLoading(true);
@@ -1010,6 +1028,7 @@ function App() {
               {alert.status === "open" && <button type="button" onClick={() => void updateAlert(alert, "acknowledgements")}>Acknowledge</button>}
               {["open", "acknowledged"].includes(alert.status) && <button className="secondary-button" type="button" onClick={() => void updateAlert(alert, "resolve")}>Resolve</button>}
               {alert.evidence_available && <button className="secondary-button" type="button" onClick={() => void approveEvidenceForDemo(alert)}>Approve evidence for demo viewing</button>}
+              {!alert.evidence_available && <button className="secondary-button" type="button" onClick={() => void retryAlertEvidence(alert)}>Retry evidence generation</button>}
             </div>}
           </article>)}
         </div>}
