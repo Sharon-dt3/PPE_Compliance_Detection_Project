@@ -1,114 +1,73 @@
-"""Benchmark melihuzunoglu/ppe-detection against a held-out labeled hard-hat test set.
+"""Benchmark hafizqaim/Workspace-Safety-Detection-using-YOLOv8 against the same held-out
+test set, seed, and matching methodology as run_ppe_benchmark.py -- the second of the two
+previously-untested Tier-2 candidates.
 
-Dataset: keremberke/hard-hat-detection (Hugging Face Datasets), a Roboflow export of a
-hard-hat/no-hard-hat detection set, COCO-format annotations, `test` split (2001 images).
-This dataset only annotates two classes (hardhat, no-hardhat) — it does not label vest,
-person, gloves, or glasses, so this benchmark covers helmet/no_helmet only. That scope
-limitation is reported explicitly in the output rather than implied away.
+Unlike every other candidate benchmarked so far, this one's weights are not published on
+Hugging Face Hub -- the model card only exists as a GitHub repository
+(https://github.com/hafizqaim/Workspace-Safety-Detection-using-YOLOv8) whose trained
+`best.pt` is attached to a GitHub Release, not committed to the repo itself. Hence its own
+loader here (download-by-URL) rather than reusing `run_ppe_benchmark.py`'s
+`hf_hub_download`-based CANDIDATES registry.
+
+The checkpoint's embedded class list (17 classes, inspected directly from the loaded
+Ultralytics model rather than assumed) is:
+  0 Barefoots, 1 Ear-protection, 2 Harness, 3 No_Ear-Protection, 4 No_Glasses, 5 Sandals,
+  6 boots, 7 face_mask, 8 face_nomask, 9 glasses, 10 hand_glove, 11 hand_noglove,
+  12 head_helmet, 13 head_nohelmet, 14 person, 15 shoes, 16 vest
+Only head_helmet/head_nohelmet/person/vest map to this benchmark's ground truth
+(helmet/no_helmet only, per run_ppe_benchmark.py's dataset scope note); every other class
+is preserved as unmapped, not silently dropped.
+
+Usage:
+    cd backend/benchmarks
+    ../.venv/bin/python run_workspace_safety_benchmark.py
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import random
 import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
 from ultralytics import YOLO
-from huggingface_hub import hf_hub_download
 
-RANDOM_SEED = 20260909
-SAMPLE_SIZE = 300
-IOU_THRESHOLD = 0.5
-CONF_THRESHOLD = 0.25
+from run_ppe_benchmark import CONF_THRESHOLD, IOU_THRESHOLD, RANDOM_SEED, SAMPLE_SIZE, DATA_DIR, iou, load_ground_truth
+import random
 
-DATA_DIR = Path("data/test")
-ANNOTATIONS_PATH = DATA_DIR / "_annotations.coco.json"
+WEIGHTS_URL = (
+    "https://github.com/hafizqaim/Workspace-Safety-Detection-using-YOLOv8/"
+    "releases/download/v1.0.0/best.pt"
+)
+WEIGHTS_CACHE = Path("data/workspace-safety-detection-best.pt")
 
-# Normalize the ground-truth categories to the application's shared label set (see
-# backend/app/detection.py `_LABELS`).
-GT_LABEL_MAP = {"hardhat": "helmet", "no-hardhat": "no_helmet"}
-
-CANDIDATES: dict[str, dict[str, object]] = {
-    "melihuzunoglu/ppe-detection": {
-        "filename": "best.pt",
-        "label_map": {"human": "person", "helmet": "helmet", "no-helmet": "no_helmet", "vest": "vest"},
-    },
-    "Hansung-Cho/yolov8-ppe-detection": {
-        "filename": "best.pt",
-        "label_map": {
-            "hardhat": "helmet",
-            "no-hardhat": "no_helmet",
-            "safety vest": "vest",
-            "no-safety vest": "no_vest",
-            "person": "person",
-        },
-    },
-    "Hexmon/vyra-yolo-ppe-detection": {
-        "filename": "best.pt",
-        "label_map": {
-            "hardhat": "helmet",
-            "no-hardhat": "no_helmet",
-            "safety vest": "vest",
-            "no-safety vest": "no_vest",
-            "person": "person",
-        },
-    },
+LABEL_MAP = {
+    "head_helmet": "helmet",
+    "head_nohelmet": "no_helmet",
+    "person": "person",
+    "vest": "vest",
 }
 
 
-def iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float, float, float]) -> float:
-    """Return intersection-over-union for two (x1, y1, x2, y2) boxes."""
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    intersection = iw * ih
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def load_ground_truth() -> tuple[dict[int, dict], dict[int, list[dict]]]:
-    """Load COCO images and per-image ground-truth boxes normalized to our label set."""
-    data = json.loads(ANNOTATIONS_PATH.read_text())
-    categories = {c["id"]: c["name"] for c in data["categories"]}
-    images = {img["id"]: img for img in data["images"]}
-    gt_by_image: dict[int, list[dict]] = defaultdict(list)
-    for ann in data["annotations"]:
-        raw_name = categories[ann["category_id"]]
-        label = GT_LABEL_MAP.get(raw_name)
-        if label is None:
-            continue
-        x, y, w, h = ann["bbox"]
-        gt_by_image[ann["image_id"]].append({"label": label, "box": (x, y, x + w, y + h), "matched": False})
-    return images, gt_by_image
+def download_weights() -> Path:
+    if not WEIGHTS_CACHE.is_file():
+        WEIGHTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading weights from {WEIGHTS_URL} ...")
+        urllib.request.urlretrieve(WEIGHTS_URL, WEIGHTS_CACHE)
+    return WEIGHTS_CACHE
 
 
 def main() -> None:
-    """Run the benchmark and print a class-level, non-aggregated report."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-id", default="melihuzunoglu/ppe-detection", choices=list(CANDIDATES))
-    args = parser.parse_args()
-    candidate = CANDIDATES[args.repo_id]
-    model_label_map: dict[str, str] = candidate["label_map"]  # type: ignore[assignment]
+    print("Candidate: hafizqaim/Workspace-Safety-Detection-using-YOLOv8")
+    model_path = download_weights()
+    model = YOLO(str(model_path))
 
     images, gt_by_image = load_ground_truth()
     eligible_image_ids = [image_id for image_id in images if gt_by_image.get(image_id)]
     random.Random(RANDOM_SEED).shuffle(eligible_image_ids)
     sample_ids = eligible_image_ids[:SAMPLE_SIZE]
 
-    print(f"Candidate: {args.repo_id}")
-    model_path = hf_hub_download(repo_id=args.repo_id, filename=str(candidate["filename"]))
-    model = YOLO(model_path)
-
-    counts: dict[str, dict[str, int]] = {
-        label: {"tp": 0, "fp": 0, "fn": 0} for label in ("helmet", "no_helmet")
-    }
+    counts: dict[str, dict[str, int]] = {label: {"tp": 0, "fp": 0, "fn": 0} for label in ("helmet", "no_helmet")}
     tp_confidences: dict[str, list[float]] = defaultdict(list)
     fp_confidences: dict[str, list[float]] = defaultdict(list)
     unmapped_detections = 0
@@ -117,7 +76,7 @@ def main() -> None:
     latencies_ms: list[float] = []
     failure_examples: list[str] = []
 
-    for image_id in sample_ids:
+    for index, image_id in enumerate(sample_ids):
         image_meta = images[image_id]
         image_path = DATA_DIR / image_meta["file_name"]
         if not image_path.is_file():
@@ -134,7 +93,7 @@ def main() -> None:
             raw_label = str(names[int(box.cls[0])]).lower()
             confidence = float(box.conf[0])
             total_detections += 1
-            label = model_label_map.get(raw_label)
+            label = LABEL_MAP.get(raw_label)
             if label is None:
                 unmapped_detections += 1
                 continue
@@ -171,7 +130,10 @@ def main() -> None:
         if image_had_failure and len(failure_examples) < 8:
             failure_examples.append(image_meta["file_name"])
 
-    print(f"Sampled {len(sample_ids)} of {len(eligible_image_ids)} eligible held-out test images")
+        if (index + 1) % 50 == 0:
+            print(f"  ...{index + 1}/{len(sample_ids)} images scored")
+
+    print(f"\nSampled {len(sample_ids)} of {len(eligible_image_ids)} eligible held-out test images")
     print(f"Random seed: {RANDOM_SEED}  IoU threshold: {IOU_THRESHOLD}  Confidence threshold: {CONF_THRESHOLD}")
     print()
     print("Per-class results:")
@@ -192,10 +154,13 @@ def main() -> None:
         )
     print()
     print(f"Total raw detections: {total_detections}")
-    print(f"Unmapped-label detections (preserved as unknown_label, excluded from compliance calc): {unmapped_detections}")
+    print(f"Unmapped-label detections (13 of 17 trained classes are out of scope; excluded from compliance calc): {unmapped_detections}")
     print(f"Detections below the {CONF_THRESHOLD} confidence threshold (excluded before matching): {below_threshold_would_be}")
-    print(f"Latency: mean={sum(latencies_ms)/len(latencies_ms):.1f}ms  "
-          f"min={min(latencies_ms):.1f}ms  max={max(latencies_ms):.1f}ms  (CPU inference, single image per call)")
+    if latencies_ms:
+        print(
+            f"Latency: mean={sum(latencies_ms)/len(latencies_ms):.1f}ms  "
+            f"min={min(latencies_ms):.1f}ms  max={max(latencies_ms):.1f}ms  (CPU inference, single image per call)"
+        )
     print()
     print("Representative failure-case filenames (false positive or missed detection present):")
     for filename in failure_examples:

@@ -15,3 +15,4 @@ frontend/dist/
 frontend/tsconfig.tsbuildinfo
 frontend/.env
 backend/benchmarks/data/
+backend/benchmarks/yolox_finetune/

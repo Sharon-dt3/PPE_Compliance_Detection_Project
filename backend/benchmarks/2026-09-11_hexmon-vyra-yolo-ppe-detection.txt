@@ -1,0 +1,22 @@
+Candidate: Hexmon/vyra-yolo-ppe-detection
+Sampled 300 of 1974 eligible held-out test images
+Random seed: 20260909  IoU threshold: 0.5  Confidence threshold: 0.25
+
+Per-class results:
+  helmet       TP= 606 FP=  68 FN=  66 precision=0.899 recall=0.902 f1=0.9 mean_TP_confidence=0.714 mean_FP_confidence=0.489
+  no_helmet    TP= 112 FP=  15 FN=  36 precision=0.882 recall=0.757 f1=0.815 mean_TP_confidence=0.658 mean_FP_confidence=0.576
+
+Total raw detections: 929
+Unmapped-label detections (preserved as unknown_label, excluded from compliance calc): 38
+Detections below the 0.25 confidence threshold (excluded before matching): 0
+Latency: mean=288.7ms  min=236.7ms  max=2331.2ms  (CPU inference, single image per call)
+
+Representative failure-case filenames (false positive or missed detection present):
+  ppe_0686_jpg.rf.fa92c2a9051846e95f88fcc36cf82f27.jpg
+  -2437-_png_jpg.rf.626b82da5cd1b4d1a6eebb5ec8683c65.jpg
+  IMG_9950-1-_mp4-77_jpg.rf.4d12c4583c89ddfabd73fa48258cef49.jpg
+  TB2R28UvUOWBKNjSZKzXXXfWFXa_-1116877752_jpg.rf.4652f750833f204c8d5721c598de6b62.jpg
+  -2185-_png_jpg.rf.7050cc17563d7306208ba104f85ef9e2.jpg
+  002270_jpg.rf.159b7b3306cba20053012412a5dc2dae.jpg
+  IMG_1492_mp4-14_jpg.rf.b9682cd30dd8fca7ed9ad546f9ae9c83.jpg
+  000236_jpg.rf.5f5df35f305a3f921f6d1ff543f975fa.jpg

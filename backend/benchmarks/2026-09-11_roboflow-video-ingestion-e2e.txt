@@ -1,0 +1,19 @@
+Video file: /tmp/ppe_video_test.mp4
+Decoded metadata: 50 frames, 10.0 native fps, 640x480
+Sampling at 2.0 fps target -> stride=5 (every 5th frame)
+  frame    0: API OK in 756ms, 0 raw detection(s)
+  frame    5: API OK in 749ms, 0 raw detection(s)
+  frame   10: API OK in 683ms, 0 raw detection(s)
+  frame   15: API OK in 676ms, 0 raw detection(s)
+  frame   20: API OK in 748ms, 0 raw detection(s)
+  frame   25: API OK in 648ms, 0 raw detection(s)
+  frame   30: API OK in 742ms, 0 raw detection(s)
+  frame   35: API OK in 652ms, 0 raw detection(s)
+  frame   40: API OK in 689ms, 0 raw detection(s)
+  frame   45: API OK in 675ms, 0 raw detection(s)
+
+Sampled 10 of 50 decoded frames
+Roboflow API calls: 10/10 succeeded
+Total raw detections across all sampled frames: 0
+
+PASS: video decode -> frame sampling -> hosted PPE inference API -> parsed response all completed end to end with zero errors.
