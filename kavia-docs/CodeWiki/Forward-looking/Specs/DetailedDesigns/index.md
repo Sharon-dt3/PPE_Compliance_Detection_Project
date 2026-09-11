@@ -7,3 +7,4 @@
 - [PPE compliance technology decisions](ppe-compliance-technology-decisions.md)
 - [PPE compliance model evaluation](ppe-compliance-model-evaluation.md)
 - [PPE compliance Phase 2 pilot scope memo](ppe-compliance-phase-2-pilot-scope.md)
+- [PPE compliance DPIA input document](ppe-compliance-dpia-input.md)
