@@ -114,12 +114,21 @@ def _upgrade_frame_observations(connection: Connection) -> None:
 
 
 def _upgrade_frame_observation_expiry(connection: Connection) -> None:
-    """Add an explicit expiry timestamp to legacy frame summaries safely."""
+    """Add an explicit expiry timestamp to legacy frame summaries safely.
+
+    The backfill's date-arithmetic syntax differs by dialect: Postgres uses
+    `created_at + interval '24 hours'`, while SQLite has no INTERVAL type and needs
+    `datetime(created_at, '+24 hours')` instead.
+    """
     _add_missing_columns(connection, "frame_observations", {"expires_at": "TIMESTAMP"})
+    if connection.dialect.name == "sqlite":
+        backfill_expression = "datetime(created_at, '+24 hours')"
+    else:
+        backfill_expression = "created_at + interval '24 hours'"
     connection.execute(
         text(
             "UPDATE frame_observations "
-            "SET expires_at = created_at + interval '24 hours' "
+            f"SET expires_at = {backfill_expression} "
             "WHERE expires_at IS NULL"
         )
     )
