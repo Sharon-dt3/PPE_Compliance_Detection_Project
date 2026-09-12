@@ -84,7 +84,16 @@ def test_reporting_settings_round_trip_and_role_enforcement() -> None:
     whatever the current value is.
     """
     with TestClient(app) as client:
-        forbidden = client.get("/api/v1/settings/reporting", headers=_demo_headers("safety_supervisor"))
+        # Read access is intentionally broad -- anyone who can view the dashboard needs it to
+        # populate the dashboard's own shift-filter options, not just for administration.
+        supervisor_view = client.get("/api/v1/settings/reporting", headers=_demo_headers("safety_supervisor"))
+        assert supervisor_view.status_code == 200
+
+        forbidden = client.patch(
+            "/api/v1/settings/reporting",
+            headers=_demo_headers("safety_supervisor"),
+            json={"shift_schedule": {"day": [0, 24]}},
+        )
         assert forbidden.status_code == 403
 
         baseline = client.get("/api/v1/settings/reporting", headers=_demo_headers("administrator"))

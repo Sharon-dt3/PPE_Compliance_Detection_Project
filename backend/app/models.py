@@ -235,6 +235,35 @@ class EvidenceSnapshot(Base):
         return value
 
 
+class JobPreview(Base):
+    """Private, face-blurred, annotated preview generated for every completed media job.
+
+    Distinct from ``EvidenceSnapshot``, which exists only once a job produces a confirmed,
+    persistent compliance alert: this lets a reviewer see what the detector actually found
+    on *any* completed job -- including one that never crossed the persistence threshold --
+    without that job needing to become a safety alert first. Uses the exact same fail-closed
+    face-blur guarantee: a row here can only ever exist once blurring has already succeeded.
+    """
+
+    __tablename__ = "job_previews"
+    __table_args__ = (CheckConstraint("blurred = true", name="ck_job_preview_blurred_true"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id: Mapped[str] = mapped_column(ForeignKey("media_jobs.id"), nullable=False, unique=True, index=True)
+    storage_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    blurred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @validates("blurred")
+    def _reject_unblurred(self, _key: str, value: bool) -> bool:
+        """Refuse to construct a preview record unless face-blurring already succeeded."""
+        if not value:
+            raise ValueError("A job preview may only be persisted after face-blurring succeeds.")
+        return value
+
+
 class MetricRollup(Base):
     """A retained aggregate safety metric without media references or identities."""
 

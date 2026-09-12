@@ -52,6 +52,7 @@ type Job = {
   unknown_count: number;
   message: string;
   failure_code: string | null;
+  preview_available: boolean;
 };
 
 type Alert = {
@@ -97,6 +98,10 @@ type AlertMetrics = {
   average_resolution_minutes: number | null;
   disclaimer: string;
 };
+
+type ReportingSettings = { shift_schedule: Record<string, [number, number]>; updated_at: string };
+
+type DashboardFilters = { zoneId: string; sourceId: string; shift: string };
 
 type FrameSummary = {
   frame_index: number;
@@ -446,6 +451,8 @@ function App() {
   const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [alertMetrics, setAlertMetrics] = useState<AlertMetrics | null>(null);
   const [openAlertCount, setOpenAlertCount] = useState(0);
+  const [shiftSchedule, setShiftSchedule] = useState<Record<string, [number, number]>>({});
+  const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>({ zoneId: "", sourceId: "", shift: "" });
   const [evaluations, setEvaluations] = useState<ModelEvaluation[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [users, setUsers] = useState<PlatformUser[]>([]);
@@ -469,22 +476,37 @@ function App() {
     window.history.pushState({}, "", routeFor(nextView));
   };
 
-  const loadForRole = async (activeRole: Role) => {
+  const loadForRole = async (activeRole: Role, filters: DashboardFilters = dashboardFilters) => {
     setLoading(true);
     try {
       const zonePromise = request<Zone[]>(activeRole, "/api/v1/zones");
       const sourcesAllowed = ["safety_supervisor", "hse_manager", "administrator"].includes(activeRole);
-      const dashboardAllowed = ["hse_manager", "administrator", "governance_reviewer", "demonstration_viewer"].includes(activeRole);
+      const dashboardAllowed = ["safety_supervisor", "hse_manager", "administrator", "governance_reviewer", "demonstration_viewer"].includes(activeRole);
       const alertsAllowed = ["safety_supervisor", "hse_manager", "administrator", "demonstration_viewer"].includes(activeRole);
 
-      const [zoneData, sourceData, jobData, alertData, reportData, trendData, metricsData] = await Promise.all([
+      // Compliance/trend accept zone, camera, and shift; alert metrics only accept zone and
+      // camera (the backend's alert_totals has no shift dimension) -- built as two query
+      // strings rather than sending a shift param the alerts endpoint would silently ignore.
+      const complianceParams = new URLSearchParams();
+      if (filters.zoneId) complianceParams.set("zone_id", filters.zoneId);
+      if (filters.sourceId) complianceParams.set("source_id", filters.sourceId);
+      if (filters.shift) complianceParams.set("shift", filters.shift);
+      const complianceQuery = complianceParams.toString() ? `?${complianceParams.toString()}` : "";
+
+      const alertParams = new URLSearchParams();
+      if (filters.zoneId) alertParams.set("zone_id", filters.zoneId);
+      if (filters.sourceId) alertParams.set("source_id", filters.sourceId);
+      const alertQuery = alertParams.toString() ? `?${alertParams.toString()}` : "";
+
+      const [zoneData, sourceData, jobData, alertData, reportData, trendData, metricsData, reportingSettings] = await Promise.all([
         zonePromise,
         sourcesAllowed ? request<Source[]>(activeRole, "/api/v1/sources") : Promise.resolve([]),
         sourcesAllowed ? request<Job[]>(activeRole, "/api/v1/media-jobs") : Promise.resolve([]),
         alertsAllowed ? request<Alert[]>(activeRole, "/api/v1/alerts") : Promise.resolve([]),
-        dashboardAllowed ? request<Report>(activeRole, "/api/v1/reports/compliance") : Promise.resolve(null),
-        dashboardAllowed ? request<TrendPoint[]>(activeRole, "/api/v1/reports/compliance/trend") : Promise.resolve([]),
-        dashboardAllowed ? request<AlertMetrics>(activeRole, "/api/v1/reports/alerts") : Promise.resolve(null),
+        dashboardAllowed ? request<Report>(activeRole, `/api/v1/reports/compliance${complianceQuery}`) : Promise.resolve(null),
+        dashboardAllowed ? request<TrendPoint[]>(activeRole, `/api/v1/reports/compliance/trend${complianceQuery}`) : Promise.resolve([]),
+        dashboardAllowed ? request<AlertMetrics>(activeRole, `/api/v1/reports/alerts${alertQuery}`) : Promise.resolve(null),
+        dashboardAllowed ? request<ReportingSettings>(activeRole, "/api/v1/settings/reporting").catch(() => null) : Promise.resolve(null),
       ]);
 
       setZones(zoneData);
@@ -494,6 +516,7 @@ function App() {
       setReport(reportData);
       setTrend(trendData);
       setAlertMetrics(metricsData);
+      if (reportingSettings) setShiftSchedule(reportingSettings.shift_schedule);
       setSourceId((current) => current || sourceData[0]?.id || "");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Unable to load this permitted POC workflow.");
@@ -536,9 +559,9 @@ function App() {
 
   useEffect(() => {
     if (!role || !jobs.some((job) => ["queued", "validating", "processing"].includes(job.status))) return undefined;
-    const timer = window.setInterval(() => void loadForRole(role), 3000);
+    const timer = window.setInterval(() => void loadForRole(role, dashboardFilters), 3000);
     return () => window.clearInterval(timer);
-  }, [jobs, role]);
+  }, [jobs, role, dashboardFilters]);
 
   // The response loop's "who receives an alert" answer for this POC: rather than an
   // external push channel (email/webhook both need infrastructure this environment doesn't
@@ -619,19 +642,28 @@ function App() {
     }
   };
 
-  const updateAlert = async (alert: Alert, action: "acknowledgements" | "resolve") => {
+  const updateAlert = async (alert: Alert, action: "acknowledgements" | "resolve" | "cancel") => {
     if (!role) return;
-    const actionLabel = action === "resolve" ? "resolution outcome" : "safety intervention";
-    const note = window.prompt(`Record the non-identifying ${actionLabel}:`);
-    if (!note?.trim()) return;
+    const actionLabel = action === "resolve" ? "resolution outcome" : action === "cancel" ? "cancellation reason" : "safety intervention";
+    // The note is optional (FR-ALERT-03): only an explicit Cancel of this prompt aborts the
+    // action entirely. An OK with no text still submits, with no note recorded -- matching
+    // what the API itself accepts.
+    const note = window.prompt(`Record the non-identifying ${actionLabel} (optional -- leave blank and press OK to skip):`);
+    if (note === null) return;
 
     setLoading(true);
     try {
       await request<Alert>(role, `/api/v1/alerts/${alert.id}/${action}`, {
         method: "POST",
-        body: JSON.stringify({ note: note.trim() }),
+        body: JSON.stringify({ note: note.trim() || null }),
       });
-      setNotice(action === "resolve" ? "Safety alert resolved after human review." : "Safety alert acknowledged and intervention recorded.");
+      setNotice(
+        action === "resolve"
+          ? "Safety alert resolved after human review."
+          : action === "cancel"
+            ? "Safety alert cancelled as raised in error."
+            : "Safety alert acknowledged and intervention recorded.",
+      );
       await loadForRole(role);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The alert update could not be completed.");
@@ -900,6 +932,11 @@ function App() {
     }
   };
 
+  const updateDashboardFilters = (nextFilters: DashboardFilters) => {
+    setDashboardFilters(nextFilters);
+    if (role) void loadForRole(role, nextFilters);
+  };
+
   const exportAggregate = async () => {
     if (!role) return;
     setLoading(true);
@@ -907,7 +944,11 @@ function App() {
       const response = await fetch(`${API_URL}/api/v1/reports/exports`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(await resolveAuthHeader(role)) },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          zone_id: dashboardFilters.zoneId || undefined,
+          source_id: dashboardFilters.sourceId || undefined,
+          shift: dashboardFilters.shift || undefined,
+        }),
       });
       if (!response.ok) throw new Error("The aggregate export could not be generated.");
       const content = await response.blob();
@@ -937,6 +978,41 @@ function App() {
   const renderDashboard = () => (
     <>
       <PageHeader title="Aggregate safety dashboard" description="Safety compliance rates are calculated as compliant ÷ (compliant + non-compliant). Unknown observations are displayed separately and excluded from the headline denominator." />
+      <section className="panel filter-panel" aria-label="Dashboard filters">
+        <label>Zone
+          <select
+            value={dashboardFilters.zoneId}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, zoneId: event.target.value })}
+          >
+            <option value="">All zones</option>
+            {zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}
+          </select>
+        </label>
+        <label>Camera
+          <select
+            value={dashboardFilters.sourceId}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, sourceId: event.target.value })}
+          >
+            <option value="">All cameras</option>
+            {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
+          </select>
+        </label>
+        <label>Shift
+          <select
+            value={dashboardFilters.shift}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, shift: event.target.value })}
+          >
+            <option value="">All shifts</option>
+            {Object.keys(shiftSchedule).map((shiftName) => <option key={shiftName} value={shiftName}>{shiftName}</option>)}
+          </select>
+        </label>
+        {(dashboardFilters.zoneId || dashboardFilters.sourceId || dashboardFilters.shift) && (
+          <button className="secondary-button" type="button" onClick={() => updateDashboardFilters({ zoneId: "", sourceId: "", shift: "" })}>
+            Clear filters
+          </button>
+        )}
+        <p className="muted">Shift filtering applies to compliance rate and trend only; alert totals below are scoped by zone and camera.</p>
+      </section>
       <section className="metrics" aria-label="Aggregate compliance metrics">
         <Metric label="Compliance rate" value={report?.compliance_rate === null || report?.compliance_rate === undefined ? "—" : `${report.compliance_rate}%`} />
         <Metric label="Assessed observations" value={report ? report.compliant + report.non_compliant : 0} detail={report ? `${report.compliant} compliant / ${report.non_compliant} non-compliant` : undefined} />
@@ -984,11 +1060,21 @@ function App() {
       <PageHeader title="Private media processing" description="Manual CCTV image and video uploads only. Live RTSP/VMS ingestion is intentionally outside this POC." action={<button type="button" onClick={() => navigate("media-new")}>New media job</button>} />
       {selectedJob && <section className="panel detail-panel">
         <div className="panel-heading"><div><h2>{selectedJob.filename}</h2><p className="muted">Privacy-safe sampled-frame summaries only.</p></div><button className="secondary-button" type="button" onClick={() => setSelectedJob(null)}>Close detail</button></div>
+        {role && (selectedJob.preview_available
+          ? <JobPreviewLink jobId={selectedJob.id} role={role} onError={setNotice} />
+          : <EmptyState title="No preview available" text="A face-blurred preview is generated for every completed job; this one hasn't finished processing yet, its preview expired, or mandatory privacy processing could not run." />)}
         <div className="metrics compact-metrics">
           <Metric label="Compliant" value={selectedJob.compliant_count} />
           <Metric label="Non-compliant" value={selectedJob.non_compliant_count} />
           <Metric label="Unknown" value={selectedJob.unknown_count} />
         </div>
+        <p className="muted">
+          These totals count only <strong>persistent</strong> violations -- a requirement failing across this
+          zone's configured number of consecutive sampled frames. The table below shows each individual sampled
+          frame's own raw observation, which can show a violation that never persisted long enough to appear in
+          the totals above (a single-image upload has exactly one frame, so it can never reach a multi-frame
+          threshold on its own). Both are correct; they answer different questions.
+        </p>
         {frames.length ? <table><thead><tr><th>Frame</th><th>Observed population</th><th>Compliant</th><th>Non-compliant</th><th>Unknown</th></tr></thead><tbody>
           {frames.map((frame) => <tr key={frame.frame_index}><td>{frame.frame_index}</td><td>{frame.person_count}</td><td>{frame.compliant_count}</td><td>{frame.non_compliant_count}</td><td>{frame.unknown_count}</td></tr>)}
         </tbody></table> : <EmptyState title="No frame observations" text="Frame summaries become available after media processing begins." />}
@@ -997,7 +1083,7 @@ function App() {
         <h2>Recent processing jobs</h2>
         {jobs.length === 0 ? <EmptyState title="No media jobs" text="Create a private processing job to demonstrate the upload-to-review workflow." /> : <div className="jobs">
           {jobs.map((job) => <article className="job" key={job.id}>
-            <div><Status status={job.status} /><h3>{job.filename}</h3><p>{formatDate(job.submitted_at)} · Compliant: {job.compliant_count} · Non-compliant: {job.non_compliant_count} · Unknown: {job.unknown_count}</p><p className="muted">{job.message}</p></div>
+            <div><Status status={job.status} /><h3>{job.filename}</h3><p>{sources.find((source) => source.id === job.source_id)?.name ?? "Unknown source"} · {formatDate(job.submitted_at)} · Compliant: {job.compliant_count} · Non-compliant: {job.non_compliant_count} · Unknown: {job.unknown_count}</p><p className="muted">{job.message}</p></div>
             <div className="button-row"><button className="secondary-button" type="button" onClick={() => void openJob(job)}>View summary</button>{["queued", "validating", "processing"].includes(job.status) && <button type="button" onClick={() => void cancelJob(role, job, loadForRole, setNotice, setLoading)}>Cancel</button>}{job.status === "failed" && <button type="button" onClick={() => void retryJob(role, job, loadForRole, setNotice, setLoading)}>Retry</button>}</div>
           </article>)}
         </div>}
@@ -1045,6 +1131,7 @@ function App() {
             {role === "safety_supervisor" && <div className="button-stack">
               {alert.status === "open" && <button type="button" onClick={() => void updateAlert(alert, "acknowledgements")}>Acknowledge</button>}
               {["open", "acknowledged"].includes(alert.status) && <button className="secondary-button" type="button" onClick={() => void updateAlert(alert, "resolve")}>Resolve</button>}
+              {alert.status === "open" && <button className="secondary-button" type="button" onClick={() => void updateAlert(alert, "cancel")}>Cancel (raised in error)</button>}
               {alert.evidence_available && <button className="secondary-button" type="button" onClick={() => void approveEvidenceForDemo(alert)}>Approve evidence for demo viewing</button>}
               {!alert.evidence_available && <button className="secondary-button" type="button" onClick={() => void retryAlertEvidence(alert)}>Retry evidence generation</button>}
             </div>}
@@ -1285,6 +1372,33 @@ function EvidenceLink({ alertId, role, onError }: { alertId: string; role: Role;
 
   if (expired) return <EvidenceExpired />;
   return <div className="evidence-control">{url ? <img alt="Face-blurred PPE safety alert evidence" className="evidence-image" src={url} /> : <button className="text-button" type="button" onClick={() => void viewEvidence()}>View privacy-processed evidence</button>}</div>;
+}
+
+function JobPreviewLink({ jobId, role, onError }: { jobId: string; role: Role; onError: (message: string) => void }) {
+  /** Show what the detector actually found for this job -- every completed job, not only
+   * ones that produced a confirmed alert. Same privacy-processed, face-blurred image the
+   * alert evidence view uses, fetched from the job-scoped endpoint instead. */
+  const [url, setUrl] = useState<string | null>(null);
+  const [expired, setExpired] = useState(false);
+
+  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+
+  const viewPreview = async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/v1/media-jobs/${jobId}/preview`, { headers: await resolveAuthHeader(role) });
+      if (!response.ok) {
+        setExpired(true);
+        throw new Error("A preview is unavailable or expired for this job.");
+      }
+      const previewUrl = URL.createObjectURL(await response.blob());
+      setUrl(previewUrl);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "The job preview is unavailable.");
+    }
+  };
+
+  if (expired) return <EvidenceExpired />;
+  return <div className="evidence-control">{url ? <img alt="Face-blurred, annotated preview of what the detector found in this job" className="evidence-image" src={url} /> : <button className="text-button" type="button" onClick={() => void viewPreview()}>View what the detector found</button>}</div>;
 }
 
 const formatDate = (value: string) => new Date(value).toLocaleString();

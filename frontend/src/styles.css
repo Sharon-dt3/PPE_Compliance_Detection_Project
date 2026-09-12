@@ -255,6 +255,23 @@ textarea { min-height: 100px; resize: vertical; }
 .status.expired,
 .status.poc_only { background: #ffe3e3; color: #c92a2a; }
 
+.filter-panel {
+  align-items: flex-end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.filter-panel label {
+  display: flex;
+  flex-direction: column;
+  font-weight: 600;
+  gap: .3rem;
+  min-width: 10rem;
+}
+
+.filter-panel p.muted { flex-basis: 100%; margin: 0; }
+
 .button-row,
 .button-stack { display: flex; flex-wrap: wrap; gap: .55rem; }
 

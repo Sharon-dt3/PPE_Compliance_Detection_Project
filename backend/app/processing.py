@@ -27,6 +27,7 @@ from app.models import (
     EventAcknowledgement,
     EventRuleResult,
     FrameObservation,
+    JobPreview,
     JobStatus,
     MediaJob,
     MetricRollup,
@@ -196,6 +197,13 @@ def _persist_outcome(
     )
 
     _persist_frame_observations(session, job, policy, detections)
+    if not session.scalar(select(JobPreview).where(JobPreview.job_id == job.id)):
+        preview_objects = detections.frames[-1].objects if detections.frames else ()
+        policy_result = (
+            f"{decision.compliant_count} compliant / {decision.non_compliant_count} non-compliant / "
+            f"{decision.unknown_count} unknown"
+        )
+        attempt_job_preview_generation(session, job, media_path, preview_objects, policy_result, policy.evidence_retention_hours)
     if not session.scalar(select(MetricRollup).where(MetricRollup.job_id == job.id)):
         session.add(
             MetricRollup(
@@ -382,6 +390,57 @@ def attempt_evidence_generation(
         actor_reference,
         actor_role,
         "Face-blurred evidence created.",
+    )
+    return True
+
+
+def attempt_job_preview_generation(
+    session: Session,
+    job: MediaJob,
+    media_path: str,
+    preview_objects: tuple[DetectedObject, ...],
+    policy_result: str,
+    preview_retention_hours: int,
+) -> bool:
+    """Run the same fail-closed face-blur pipeline for every completed job, not just alerts.
+
+    A job that never crosses the persistence threshold into a confirmed alert still gets a
+    reviewable, privacy-safe visual of what the detector actually found -- previously the
+    job inspector showed only numeric counts, with no way to see the detection itself.
+    Silently does nothing (no row, no exception) if the mandatory privacy gate can't run;
+    this is a nice-to-have preview, not a safety-critical evidence record, so it must never
+    fail the job itself.
+    """
+    try:
+        storage_key = EvidenceService().create_annotated_blurred_evidence(media_path, preview_objects, policy_result)
+    except PrivacyProcessingError:
+        record_audit_event(
+            session,
+            "preview.blocked",
+            "media_job",
+            job.id,
+            "processing-worker",
+            "system",
+            "Mandatory face-blur gate did not complete; no job preview generated.",
+        )
+        return False
+
+    session.add(
+        JobPreview(
+            job_id=job.id,
+            storage_key=storage_key,
+            blurred=True,
+            expires_at=datetime.now(UTC) + timedelta(hours=preview_retention_hours),
+        )
+    )
+    record_audit_event(
+        session,
+        "preview.created",
+        "media_job",
+        job.id,
+        "processing-worker",
+        "system",
+        "Face-blurred job preview created.",
     )
     return True
 

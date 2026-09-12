@@ -38,6 +38,7 @@ def apply_migrations(connection: Connection) -> None:
         ("20260911_evidence_blurred_constraint", _upgrade_evidence_blurred_constraint),
         ("20260912_shift_schedule", _upgrade_shift_schedule),
         ("20260912_source_stream_url", _upgrade_source_stream_url),
+        ("20260912_job_previews", _upgrade_job_previews),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -224,6 +225,24 @@ def _upgrade_platform_settings(connection: Connection) -> None:
 def _upgrade_source_stream_url(connection: Connection) -> None:
     """Add the optional RTSP/VMS live-camera-feed URL for a camera source."""
     _add_missing_columns(connection, "camera_sources", {"stream_url": "TEXT"})
+
+
+def _upgrade_job_previews(connection: Connection) -> None:
+    """Create the per-job, face-blurred preview table (distinct from alert evidence)."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS job_previews ("
+            "id VARCHAR(36) PRIMARY KEY, "
+            "job_id VARCHAR(36) NOT NULL UNIQUE, "
+            "storage_key VARCHAR(255) NOT NULL UNIQUE, "
+            "blurred BOOLEAN NOT NULL, "
+            "expires_at TIMESTAMP NOT NULL, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+            "deleted_at TIMESTAMP, "
+            "CHECK (blurred = true))"
+        )
+    )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_job_previews_job_id ON job_previews (job_id)"))
 
 
 def _upgrade_evidence_demo_approved(connection: Connection) -> None:

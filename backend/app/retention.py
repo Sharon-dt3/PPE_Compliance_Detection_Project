@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.audit import record_audit_event
 from app.database import SessionLocal
-from app.models import AlertStatus, ComplianceAlert, EvidenceSnapshot, FrameObservation, MediaJob, PersonObservation, ZonePolicy
+from app.models import AlertStatus, ComplianceAlert, EvidenceSnapshot, FrameObservation, JobPreview, MediaJob, PersonObservation, ZonePolicy
 from app.storage import PrivateMediaStorage
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ class RetentionResult:
     status: RetentionStatus
     expired_media_deleted: int = 0
     expired_evidence_deleted: int = 0
+    expired_job_previews_deleted: int = 0
     expired_frame_summaries_deleted: int = 0
     expired_person_summaries_deleted: int = 0
     expired_alerts: int = 0
@@ -96,6 +97,7 @@ def remove_expired_private_data_for_session(
 
     media_deleted = _remove_expired_media(session, private_media, execution_time, failure_categories)
     evidence_deleted = _remove_expired_evidence(session, private_evidence, execution_time, failure_categories)
+    previews_deleted = _remove_expired_job_previews(session, private_evidence, execution_time, failure_categories)
     frame_deleted = _remove_expired_frame_summaries(session, execution_time, failure_categories)
     person_deleted = _remove_expired_person_summaries(session, execution_time, failure_categories)
     alerts_expired = _expire_stale_alerts(session, execution_time, failure_categories)
@@ -104,7 +106,7 @@ def remove_expired_private_data_for_session(
     status: RetentionStatus
     if failures == 0:
         status = "completed"
-    elif media_deleted or evidence_deleted or frame_deleted or person_deleted or alerts_expired:
+    elif media_deleted or evidence_deleted or previews_deleted or frame_deleted or person_deleted or alerts_expired:
         status = "completed_with_errors"
     else:
         status = "failed"
@@ -113,6 +115,7 @@ def remove_expired_private_data_for_session(
         status=status,
         expired_media_deleted=media_deleted,
         expired_evidence_deleted=evidence_deleted,
+        expired_job_previews_deleted=previews_deleted,
         expired_frame_summaries_deleted=frame_deleted,
         expired_person_summaries_deleted=person_deleted,
         expired_alerts=alerts_expired,
@@ -203,6 +206,56 @@ def _remove_expired_evidence(
                 "evidence_snapshot",
                 snapshot.id,
                 "Face-blurred evidence deletion failed; evidence remains inaccessible after expiry.",
+            )
+    return deleted_count
+
+
+def _remove_expired_job_previews(
+    session: Session,
+    storage: EvidenceStorage,
+    execution_time: datetime,
+    failure_categories: list[str],
+) -> int:
+    """Delete each expired job preview while ensuring it remains API-inaccessible.
+
+    Shares the same private storage as alert evidence (`app/evidence.py`'s
+    ``EvidenceService``) and the identical fail-safe deletion pattern -- previews are the
+    same kind of privacy-processed artifact, just scoped to a job rather than an alert.
+    """
+    deleted_count = 0
+    try:
+        previews = session.scalars(
+            select(JobPreview).where(
+                JobPreview.expires_at <= execution_time,
+                JobPreview.deleted_at.is_(None),
+            )
+        ).all()
+    except SQLAlchemyError:
+        logger.exception("Unable to select expired job previews for retention.")
+        failure_categories.append("job_preview_selection")
+        return deleted_count
+
+    for preview in previews:
+        try:
+            storage.delete(preview.storage_key)
+            preview.deleted_at = execution_time
+            deleted_count += 1
+            _record_item_outcome(
+                session,
+                "retention.job_preview_deleted",
+                "job_preview",
+                preview.id,
+                "Expired job preview deleted.",
+            )
+        except OSError:
+            logger.exception("Job preview deletion failed for retention item.")
+            failure_categories.append("job_preview_deletion")
+            _record_item_outcome(
+                session,
+                "retention.failed",
+                "job_preview",
+                preview.id,
+                "Job preview deletion failed; it remains inaccessible after expiry.",
             )
     return deleted_count
 

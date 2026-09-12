@@ -33,6 +33,7 @@ from app.models import (
     EventRuleResult,
     EvidenceSnapshot,
     FrameObservation,
+    JobPreview,
     JobStatus,
     MediaJob,
     MetricRollup,
@@ -200,6 +201,7 @@ class MediaJobResponse(BaseModel):
     failure_code: str | None
     is_test_media: bool
     test_retention_approved: bool
+    preview_available: bool
 
 
 class AlertActionRequest(BaseModel):
@@ -765,9 +767,12 @@ def update_inference_settings(
 # PUBLIC_INTERFACE
 def get_reporting_settings(
     session: Session = Depends(get_session),
-    _: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR, Role.HSE_MANAGER, Role.GOVERNANCE_REVIEWER)),
+    _: AuthenticatedActor = Depends(
+        require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.GOVERNANCE_REVIEWER, Role.DEMO_VIEWER)
+    ),
 ) -> ReportingSettingsResponse:
-    """Return the active shift schedule used to label dashboard rollups."""
+    """Return the active shift schedule, readable by anyone who can view the dashboard --
+    needed to populate the dashboard's own shift-filter options, not just for administration."""
     config = get_platform_settings(session)
     session.commit()
     return _reporting_settings_response(config)
@@ -979,7 +984,7 @@ def capture_source_now(
     except Exception:
         job.message = "Queued safely. The worker is currently unavailable; processing will resume when it is restored."
         session.commit()
-    return _job_response(job)
+    return _job_response(session, job)
 
 
 @app.patch("/api/v1/zones/{zone_id}/policy", response_model=PolicyResponse, tags=["Configuration"], summary="Create and activate a zone policy version")
@@ -1093,7 +1098,7 @@ async def create_media_job(
     except Exception:
         job.message = "Queued safely. The worker is currently unavailable; processing will resume when it is restored."
         session.commit()
-    return _job_response(job)
+    return _job_response(session, job)
 
 
 @app.get("/api/v1/media-jobs", response_model=list[MediaJobResponse], tags=["Media jobs"], summary="List media processing jobs")
@@ -1104,7 +1109,7 @@ def list_media_jobs(
 ) -> list[MediaJobResponse]:
     """Return safe status summaries for recent private media-processing jobs."""
     jobs = session.scalars(select(MediaJob).order_by(MediaJob.submitted_at.desc()).limit(25)).all()
-    return [_job_response(item) for item in jobs]
+    return [_job_response(session, item) for item in jobs]
 
 
 @app.get("/api/v1/media-jobs/{job_id}", response_model=MediaJobResponse, tags=["Media jobs"], summary="Get media job status")
@@ -1116,7 +1121,7 @@ def get_media_job(
 ) -> MediaJobResponse:
     """Return a safe processing summary for one persisted media job."""
     job = _get_job_or_404(session, job_id)
-    return _job_response(job)
+    return _job_response(session, job)
 
 
 @app.get(
@@ -1149,6 +1154,40 @@ def list_media_job_frames(
     ]
 
 
+@app.get(
+    "/api/v1/media-jobs/{job_id}/preview",
+    tags=["Media jobs"],
+    summary="Get the face-blurred, annotated preview for one job",
+)
+# PUBLIC_INTERFACE
+def get_media_job_preview(
+    job_id: str,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR)),
+) -> Response:
+    """Return the privacy-processed preview image generated for this job, whether or not it
+    ever produced a confirmed alert -- this is what actually turns the job inspector's raw
+    counts into something a reviewer can look at.
+
+    Returns:
+        A face-blurred, annotated JPEG only while it remains within its retention period.
+    """
+    _get_job_or_404(session, job_id)
+    preview = session.scalar(select(JobPreview).where(JobPreview.job_id == job_id))
+    if _evidence_missing_or_expired(preview):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="A preview is unavailable or expired for this job.")
+    try:
+        from app.evidence import EvidenceService
+
+        content = EvidenceService().read(preview.storage_key)
+    except (FileNotFoundError, ImportError) as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="A preview is unavailable for this job.") from error
+
+    record_actor_audit_event(session, "preview.accessed", "media_job", job_id, actor, "Job preview viewed.")
+    session.commit()
+    return Response(content=content, media_type="image/jpeg")
+
+
 @app.post("/api/v1/media-jobs/{job_id}/cancel", response_model=MediaJobResponse, tags=["Media jobs"], summary="Cancel a pending media job")
 # PUBLIC_INTERFACE
 def cancel_media_job(
@@ -1166,7 +1205,7 @@ def cancel_media_job(
     record_actor_audit_event(session, "media_job.cancelled", "media_job", job.id, actor, "Pending processing cancelled.")
     session.commit()
     session.refresh(job)
-    return _job_response(job)
+    return _job_response(session, job)
 
 
 @app.post(
@@ -1210,7 +1249,7 @@ def retry_media_job(
         job.message = "Re-queued safely. The worker is currently unavailable; processing will resume when it is restored."
         session.commit()
     session.refresh(job)
-    return _job_response(job)
+    return _job_response(session, job)
 
 
 @app.post(
@@ -1257,7 +1296,7 @@ def approve_test_media_retention(
     )
     session.commit()
     session.refresh(job)
-    return _job_response(job)
+    return _job_response(session, job)
 
 
 @app.get("/api/v1/alerts", response_model=list[AlertResponse], tags=["Alerts"], summary="List safety alerts")
@@ -1753,8 +1792,9 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
-def _evidence_missing_or_expired(snapshot: EvidenceSnapshot | None) -> bool:
-    """Return whether evidence is absent, unblurred, deleted, or past its retention expiry."""
+def _evidence_missing_or_expired(snapshot: EvidenceSnapshot | JobPreview | None) -> bool:
+    """Return whether evidence (or a job preview, which shares the same shape) is absent,
+    unblurred, deleted, or past its retention expiry."""
     if snapshot is None or not snapshot.blurred or snapshot.deleted_at is not None:
         return True
     return _as_utc(snapshot.expires_at) <= datetime.now(UTC)
@@ -1818,8 +1858,9 @@ def _reporting_settings_response(config: PlatformSettings) -> ReportingSettingsR
     )
 
 
-def _job_response(job: MediaJob) -> MediaJobResponse:
+def _job_response(session: Session, job: MediaJob) -> MediaJobResponse:
     """Convert a private persistence entity to its safe API representation."""
+    preview = session.scalar(select(JobPreview).where(JobPreview.job_id == job.id))
     return MediaJobResponse(
         id=job.id,
         source_id=job.source_id,
@@ -1835,6 +1876,7 @@ def _job_response(job: MediaJob) -> MediaJobResponse:
         failure_code=job.failure_code,
         is_test_media=job.is_test_media,
         test_retention_approved=job.test_retention_approved,
+        preview_available=not _evidence_missing_or_expired(preview),
     )
 
 
