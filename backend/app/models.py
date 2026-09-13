@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 
@@ -34,6 +34,18 @@ class AlertStatus(str, Enum):
     RESOLVED = "resolved"
     EXPIRED = "expired"
     CANCELLED = "cancelled"
+
+
+class AlertEventType(str, Enum):
+    """The kind of reviewable safety event a ``ComplianceAlert`` represents.
+
+    A single member today (the only event this POC's rule engine ever raises), kept as an
+    enum rather than a bare string constant so a future event type -- e.g. a distinct
+    near-miss or equipment-fault category -- has a defined place to go rather than growing
+    as an untyped string sprinkled through the codebase.
+    """
+
+    PPE_NON_COMPLIANCE = "PPE_NON_COMPLIANCE"
 
 
 class ApplicationUser(Base):
@@ -145,9 +157,31 @@ class MediaJob(Base):
 
 
 class ComplianceAlert(Base):
-    """A deduplicated, non-identifying PPE non-compliance event."""
+    """A deduplicated, non-identifying PPE non-compliance event.
+
+    ``ix_compliance_alerts_dedup_active`` enforces at most one open/acknowledged alert per
+    ``deduplication_key`` at the database level -- required because two media jobs from the
+    same camera/policy/rule can finish processing concurrently (real Celery worker
+    concurrency, or a live-capture burst across sources), and a plain "check then insert" in
+    application code cannot see another transaction's uncommitted insert. Without this
+    constraint, both transactions observe no existing alert and each creates its own,
+    producing duplicate alerts for what should be a single deduplicated event. The database
+    now rejects the second insert; the losing transaction catches that and merges into the
+    winner instead (see ``_create_or_update_alert`` in ``app/processing.py``). A resolved or
+    expired alert is excluded so a genuinely new occurrence after closure can still open a
+    fresh alert.
+    """
 
     __tablename__ = "compliance_alerts"
+    __table_args__ = (
+        Index(
+            "ix_compliance_alerts_dedup_active",
+            "deduplication_key",
+            unique=True,
+            postgresql_where=text("status IN ('open', 'acknowledged')"),
+            sqlite_where=text("status IN ('open', 'acknowledged')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     job_id: Mapped[str] = mapped_column(ForeignKey("media_jobs.id"), nullable=False, index=True)
@@ -155,6 +189,7 @@ class ComplianceAlert(Base):
     zone_id: Mapped[str] = mapped_column(ForeignKey("zones.id"), nullable=False, index=True)
     policy_id: Mapped[str] = mapped_column(ForeignKey("zone_policies.id"), nullable=False)
     deduplication_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(40), default=AlertEventType.PPE_NON_COMPLIANCE.value, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default=AlertStatus.OPEN.value, nullable=False, index=True)
     failed_requirement: Mapped[str] = mapped_column(String(120), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)

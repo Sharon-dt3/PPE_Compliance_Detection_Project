@@ -39,6 +39,8 @@ def apply_migrations(connection: Connection) -> None:
         ("20260912_shift_schedule", _upgrade_shift_schedule),
         ("20260912_source_stream_url", _upgrade_source_stream_url),
         ("20260912_job_previews", _upgrade_job_previews),
+        ("20260912_alert_dedup_unique_index", _upgrade_alert_dedup_unique_index),
+        ("20260913_alert_event_type", _upgrade_alert_event_type),
     )
     for revision, upgrade in migrations:
         if revision in applied:
@@ -243,6 +245,74 @@ def _upgrade_job_previews(connection: Connection) -> None:
         )
     )
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_job_previews_job_id ON job_previews (job_id)"))
+
+
+def _upgrade_alert_dedup_unique_index(connection: Connection) -> None:
+    """Retire pre-existing duplicate active alerts, then enforce at most one open/acknowledged
+    alert per deduplication_key at the database level.
+
+    This closes a real concurrent-processing race: two media jobs from the same
+    camera/policy/rule finishing at nearly the same time could both see "no existing alert"
+    before either committed, and both create their own -- producing duplicate alerts for
+    what should be one deduplicated event (see ``_create_or_update_alert`` in
+    ``app/processing.py``). An install that already hit this race carries duplicate active
+    alerts sharing a deduplication_key, which the new unique index below cannot coexist
+    with, so each duplicate group is collapsed first: the earliest alert is kept as
+    canonical (absorbing the others' occurrence_count and latest observation time/
+    confidence), and the rest are cancelled rather than deleted, preserving their audit and
+    rule-result history.
+    """
+    duplicate_keys = connection.execute(
+        text(
+            "SELECT deduplication_key FROM compliance_alerts "
+            "WHERE status IN ('open', 'acknowledged') "
+            "GROUP BY deduplication_key HAVING COUNT(*) > 1"
+        )
+    ).all()
+    for (dedup_key,) in duplicate_keys:
+        rows = connection.execute(
+            text(
+                "SELECT id, occurrence_count, last_observed_at, confidence FROM compliance_alerts "
+                "WHERE deduplication_key = :key AND status IN ('open', 'acknowledged') "
+                "ORDER BY first_observed_at ASC"
+            ),
+            {"key": dedup_key},
+        ).all()
+        canonical_id, total_occurrences, latest_observed, best_confidence = rows[0]
+        for duplicate_id, occurrence_count, last_observed_at, confidence in rows[1:]:
+            total_occurrences += occurrence_count
+            latest_observed = max(latest_observed, last_observed_at)
+            best_confidence = max(best_confidence, confidence)
+        connection.execute(
+            text(
+                "UPDATE compliance_alerts SET occurrence_count = :count, "
+                "last_observed_at = :observed, confidence = :confidence WHERE id = :id"
+            ),
+            {"count": total_occurrences, "observed": latest_observed, "confidence": best_confidence, "id": canonical_id},
+        )
+        for duplicate_id, _, _, _ in rows[1:]:
+            connection.execute(
+                text("UPDATE compliance_alerts SET status = 'cancelled' WHERE id = :id"),
+                {"id": duplicate_id},
+            )
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_compliance_alerts_dedup_active "
+            "ON compliance_alerts (deduplication_key) "
+            "WHERE status IN ('open', 'acknowledged')"
+        )
+    )
+
+
+def _upgrade_alert_event_type(connection: Connection) -> None:
+    """Add the alert event-type column, backfilling every existing alert as
+    ``PPE_NON_COMPLIANCE`` -- the only event type this rule engine has ever raised, and the
+    literal value the original implementation plan's success criteria name explicitly."""
+    _add_missing_columns(
+        connection,
+        "compliance_alerts",
+        {"event_type": "VARCHAR(40) NOT NULL DEFAULT 'PPE_NON_COMPLIANCE'"},
+    )
 
 
 def _upgrade_evidence_demo_approved(connection: Connection) -> None:

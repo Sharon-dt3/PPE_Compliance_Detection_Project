@@ -97,6 +97,19 @@ class ZoneRequest(BaseModel):
     enabled: bool = True
 
 
+class ZoneUpdateRequest(BaseModel):
+    """Optional administrator changes to a safety zone's own name/description/enabled state.
+
+    Distinct from the zone's PPE policy, which is deliberately immutable and versioned
+    (``PolicyRequest``) -- correcting a typo in a zone's name is not a safety-relevant policy
+    change and must not require creating a whole new zone or policy version.
+    """
+
+    name: str | None = Field(default=None, min_length=3, max_length=120)
+    description: str | None = Field(default=None, min_length=3, max_length=1000)
+    enabled: bool | None = None
+
+
 class SourceRequest(BaseModel):
     """Administrator input for a manually selectable camera source."""
 
@@ -233,6 +246,7 @@ class AlertResponse(BaseModel):
     id: str
     source_id: str
     zone_id: str
+    event_type: str
     status: str
     failed_requirement: str
     confidence: float
@@ -858,6 +872,38 @@ def create_zone(
     return _zone_response(zone, policy)
 
 
+@app.patch("/api/v1/zones/{zone_id}", response_model=ZoneResponse, tags=["Configuration"], summary="Update a safety zone")
+# PUBLIC_INTERFACE
+def update_zone(
+    zone_id: str,
+    request: ZoneUpdateRequest,
+    session: Session = Depends(get_session),
+    actor: AuthenticatedActor = Depends(require_role(Role.ADMINISTRATOR)),
+) -> ZoneResponse:
+    """Apply administrator-approved changes to a zone's own name/description/enabled state.
+
+    Never touches PPE policy -- that stays immutable and versioned via the policy endpoint.
+    """
+    zone = session.get(Zone, zone_id)
+    if zone is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Configured safety zone not found.")
+    changes = request.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one zone property must be supplied.")
+    if "name" in changes and changes["name"] != zone.name:
+        if session.scalar(select(Zone).where(Zone.name == changes["name"])):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A safety zone with this name already exists.")
+    for field, value in changes.items():
+        setattr(zone, field, value)
+    policy = _currently_effective_policy(session, zone.id)
+    if policy is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The zone has no active safety policy.")
+    record_actor_audit_event(session, "configuration.zone_updated", "zone", zone.id, actor, "Safety zone configuration updated.")
+    session.commit()
+    session.refresh(zone)
+    return _zone_response(zone, policy)
+
+
 @app.get("/api/v1/sources", response_model=list[SourceResponse], tags=["Configuration"], summary="List camera sources")
 # PUBLIC_INTERFACE
 def list_sources(
@@ -1302,13 +1348,31 @@ def approve_test_media_retention(
 @app.get("/api/v1/alerts", response_model=list[AlertResponse], tags=["Alerts"], summary="List safety alerts")
 # PUBLIC_INTERFACE
 def list_alerts(
+    zone_id: Annotated[str | None, Query(description="Optional configured zone identifier.")] = None,
+    source_id: Annotated[str | None, Query(description="Optional configured source identifier.")] = None,
+    status: Annotated[str | None, Query(description="Optional alert lifecycle status filter.")] = None,
+    start_at: Annotated[datetime | None, Query(description="Inclusive alert creation start timestamp.")] = None,
+    end_at: Annotated[datetime | None, Query(description="Inclusive alert creation end timestamp.")] = None,
     session: Session = Depends(get_session),
     _: AuthenticatedActor = Depends(
         require_role(Role.SUPERVISOR, Role.HSE_MANAGER, Role.ADMINISTRATOR, Role.DEMO_VIEWER)
     ),
 ) -> list[AlertResponse]:
-    """Return persisted non-identifying safety alerts without raw media locations."""
-    alerts = session.scalars(select(ComplianceAlert).order_by(ComplianceAlert.created_at.desc())).all()
+    """Return persisted non-identifying safety alerts without raw media locations, optionally
+    scoped by zone, source, lifecycle status, and/or creation-time range so the alert queue
+    matches whatever the caller's dashboard view and queue filters are currently set to."""
+    statement = select(ComplianceAlert).order_by(ComplianceAlert.created_at.desc())
+    if zone_id:
+        statement = statement.where(ComplianceAlert.zone_id == zone_id)
+    if source_id:
+        statement = statement.where(ComplianceAlert.source_id == source_id)
+    if status:
+        statement = statement.where(ComplianceAlert.status == status)
+    if start_at:
+        statement = statement.where(ComplianceAlert.created_at >= start_at)
+    if end_at:
+        statement = statement.where(ComplianceAlert.created_at <= end_at)
+    alerts = session.scalars(statement).all()
     return [_alert_response(item) for item in alerts]
 
 
@@ -1914,6 +1978,7 @@ def _alert_response(alert: ComplianceAlert) -> AlertResponse:
         id=alert.id,
         source_id=alert.source_id,
         zone_id=alert.zone_id,
+        event_type=alert.event_type,
         status=alert.status,
         failed_requirement=alert.failed_requirement,
         confidence=alert.confidence,

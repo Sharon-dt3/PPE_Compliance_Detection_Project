@@ -164,7 +164,7 @@ def test_evidence_demo_approval_gates_demonstration_viewer_access() -> None:
                 source_id=source.id,
                 zone_id=zone.id,
                 policy_id=policy.id,
-                deduplication_key="test-dedup-key",
+                deduplication_key=f"test-dedup-key-{uuid4()}",
                 failed_requirement="helmet required",
                 confidence=0.9,
                 first_observed_at=datetime.now(UTC),

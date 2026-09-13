@@ -105,7 +105,16 @@ def _seed_model_evaluations(session: Session) -> None:
                     "sample; mean false-positive confidence (0.572-0.635) sits close to mean true-positive "
                     "confidence, so a confidence floor alone cannot substitute for evaluation against "
                     "representative footage. No Renewi camera-angle/height data represented. Requires "
-                    "Phase-2 fine-tuning on real site footage before any pilot use."
+                    "Phase-2 fine-tuning on real site footage before any pilot use. "
+                    "Gloves/glasses are not detected by any candidate evaluated for this POC (this model's "
+                    "class list is limited to helmet/no-helmet/vest/human) -- this is a licensing gap, not "
+                    "an oversight: SH17 is the only dataset found with gloves/glasses ground truth and is "
+                    "CC BY-NC-SA 4.0 (non-commercial), and the implementation plan itself directs using it "
+                    "'for benchmarking and class-coverage reference only -- do not train shippable weights "
+                    "on it.' The one public model found with these classes "
+                    "(hafizqaim/Workspace-Safety-Detection-using-YOLOv8) has no declared licence. Detecting "
+                    "gloves/glasses requires either a newly licensed dataset or Renewi's own annotated site "
+                    "footage; deferred to Phase 2 pending that."
                 ),
             ),
             ModelEvaluation(

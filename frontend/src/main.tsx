@@ -8,6 +8,9 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const SAFETY_NOTICE =
   "This POC provides indicative safety-support signals. It is not an employee productivity-monitoring system and must not be used for autonomous disciplinary or employment decisions.";
 
+// Mirrors PolicyRequest's allowed_labels set (backend app/main.py) -- keep in sync.
+const CLASS_THRESHOLD_LABELS = ["no_helmet", "no_vest", "helmet", "vest", "gloves", "glasses", "person"] as const;
+
 // "supabase" requires VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY; any other/missing
 // configuration falls back to the local demonstration role selector.
 const AUTH_MODE = import.meta.env.VITE_AUTH_MODE === "supabase" ? "supabase" : "demo";
@@ -59,6 +62,7 @@ type Alert = {
   id: string;
   source_id: string;
   zone_id: string;
+  event_type: string;
   status: "open" | "acknowledged" | "resolved" | "expired" | "cancelled";
   failed_requirement: string;
   confidence: number;
@@ -101,7 +105,9 @@ type AlertMetrics = {
 
 type ReportingSettings = { shift_schedule: Record<string, [number, number]>; updated_at: string };
 
-type DashboardFilters = { zoneId: string; sourceId: string; shift: string };
+type DashboardFilters = { zoneId: string; sourceId: string; shift: string; alertStatus: string; alertStartDate: string; alertEndDate: string };
+const EMPTY_DASHBOARD_FILTERS: DashboardFilters = { zoneId: "", sourceId: "", shift: "", alertStatus: "", alertStartDate: "", alertEndDate: "" };
+const ALERT_STATUS_OPTIONS = ["open", "acknowledged", "resolved", "expired", "cancelled"] as const;
 
 type FrameSummary = {
   frame_index: number;
@@ -451,16 +457,20 @@ function App() {
   const [trend, setTrend] = useState<TrendPoint[]>([]);
   const [alertMetrics, setAlertMetrics] = useState<AlertMetrics | null>(null);
   const [openAlertCount, setOpenAlertCount] = useState(0);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
   const [shiftSchedule, setShiftSchedule] = useState<Record<string, [number, number]>>({});
-  const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>({ zoneId: "", sourceId: "", shift: "" });
+  const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>(EMPTY_DASHBOARD_FILTERS);
   const [evaluations, setEvaluations] = useState<ModelEvaluation[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [users, setUsers] = useState<PlatformUser[]>([]);
   const [retentionSettings, setRetentionSettings] = useState<RetentionSettings | null>(null);
   const [inferenceSettings, setInferenceSettings] = useState<InferenceSettings | null>(null);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [editingSourceId, setEditingSourceId] = useState<string | null>(null);
+  const [editingZoneId, setEditingZoneId] = useState<string | null>(null);
   const [frames, setFrames] = useState<FrameSummary[]>([]);
   const [notice, setNotice] = useState("Select a permitted workflow.");
+  const [noticeKind, setNoticeKind] = useState<"success" | "error" | "info">("info");
   const [loading, setLoading] = useState(false);
   const [sourceId, setSourceId] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -470,10 +480,46 @@ function App() {
     () => zones.find((zone) => zone.id === sources.find((source) => source.id === sourceId)?.zone_id),
     [sourceId, sources, zones],
   );
+  const jobsInFlight = useMemo(
+    () => jobs.some((job) => ["queued", "validating", "processing"].includes(job.status)),
+    [jobs],
+  );
+  const jobConfidenceSummary = useMemo(() => {
+    const aggregate: Record<string, { count: number; min_confidence: number; max_confidence: number }> = {};
+    for (const frame of frames) {
+      for (const [label, stats] of Object.entries(frame.confidence_summary)) {
+        const existing = aggregate[label];
+        if (!existing) aggregate[label] = { ...stats };
+        else {
+          existing.count += stats.count;
+          existing.min_confidence = Math.min(existing.min_confidence, stats.min_confidence);
+          existing.max_confidence = Math.max(existing.max_confidence, stats.max_confidence);
+        }
+      }
+    }
+    return aggregate;
+  }, [frames]);
 
   const navigate = (nextView: View) => {
     setView(nextView);
     window.history.pushState({}, "", routeFor(nextView));
+  };
+
+  const notifySuccess = (message: string) => {
+    setNotice(message);
+    setNoticeKind("success");
+  };
+  const notifyInfo = (message: string) => {
+    setNotice(message);
+    setNoticeKind("info");
+  };
+  const notifyError = (error: unknown, fallback: string) => {
+    setNotice(error instanceof Error ? error.message : fallback);
+    setNoticeKind("error");
+  };
+  const notifyErrorMessage = (message: string) => {
+    setNotice(message);
+    setNoticeKind("error");
   };
 
   const loadForRole = async (activeRole: Role, filters: DashboardFilters = dashboardFilters) => {
@@ -498,11 +544,20 @@ function App() {
       if (filters.sourceId) alertParams.set("source_id", filters.sourceId);
       const alertQuery = alertParams.toString() ? `?${alertParams.toString()}` : "";
 
+      // The alert queue itself additionally supports status and creation-date filtering,
+      // which the aggregate /reports/alerts totals endpoint does not accept -- a separate
+      // query string, rather than appending unsupported params to alertQuery above.
+      const alertListParams = new URLSearchParams(alertParams);
+      if (filters.alertStatus) alertListParams.set("status", filters.alertStatus);
+      if (filters.alertStartDate) alertListParams.set("start_at", `${filters.alertStartDate}T00:00:00`);
+      if (filters.alertEndDate) alertListParams.set("end_at", `${filters.alertEndDate}T23:59:59`);
+      const alertListQuery = alertListParams.toString() ? `?${alertListParams.toString()}` : "";
+
       const [zoneData, sourceData, jobData, alertData, reportData, trendData, metricsData, reportingSettings] = await Promise.all([
         zonePromise,
         sourcesAllowed ? request<Source[]>(activeRole, "/api/v1/sources") : Promise.resolve([]),
         sourcesAllowed ? request<Job[]>(activeRole, "/api/v1/media-jobs") : Promise.resolve([]),
-        alertsAllowed ? request<Alert[]>(activeRole, "/api/v1/alerts") : Promise.resolve([]),
+        alertsAllowed ? request<Alert[]>(activeRole, `/api/v1/alerts${alertListQuery}`) : Promise.resolve([]),
         dashboardAllowed ? request<Report>(activeRole, `/api/v1/reports/compliance${complianceQuery}`) : Promise.resolve(null),
         dashboardAllowed ? request<TrendPoint[]>(activeRole, `/api/v1/reports/compliance/trend${complianceQuery}`) : Promise.resolve([]),
         dashboardAllowed ? request<AlertMetrics>(activeRole, `/api/v1/reports/alerts${alertQuery}`) : Promise.resolve(null),
@@ -518,8 +573,9 @@ function App() {
       setAlertMetrics(metricsData);
       if (reportingSettings) setShiftSchedule(reportingSettings.shift_schedule);
       setSourceId((current) => current || sourceData[0]?.id || "");
+      setLastUpdatedAt(new Date());
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to load this permitted POC workflow.");
+      notifyError(error, "Unable to load this permitted POC workflow.");
     } finally {
       setLoading(false);
     }
@@ -558,10 +614,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!role || !jobs.some((job) => ["queued", "validating", "processing"].includes(job.status))) return undefined;
+    if (!role || !jobsInFlight) return undefined;
     const timer = window.setInterval(() => void loadForRole(role, dashboardFilters), 3000);
     return () => window.clearInterval(timer);
-  }, [jobs, role, dashboardFilters]);
+  }, [jobsInFlight, role, dashboardFilters]);
 
   // The response loop's "who receives an alert" answer for this POC: rather than an
   // external push channel (email/webhook both need infrastructure this environment doesn't
@@ -585,14 +641,14 @@ function App() {
     setRole(nextRole);
     const defaultView = NAVIGATION.find((item) => item.roles.includes(nextRole))?.view ?? "dashboard";
     navigate(defaultView);
-    setNotice(`${ROLE_LABELS[nextRole]} demonstration role selected.`);
+    notifyInfo(`${ROLE_LABELS[nextRole]} demonstration role selected.`);
   };
 
   const handleSupabaseAuthenticated = (me: Me) => {
     setRole(me.role);
     const defaultView = NAVIGATION.find((item) => item.roles.includes(me.role))?.view ?? "dashboard";
     navigate(defaultView);
-    setNotice(`Signed in as ${ROLE_LABELS[me.role]}.`);
+    notifySuccess(`Signed in as ${ROLE_LABELS[me.role]}.`);
   };
 
   const logout = () => {
@@ -608,7 +664,7 @@ function App() {
   const submitUpload = async (event: FormEvent) => {
     event.preventDefault();
     if (!role || !sourceId || !file) {
-      setNotice("Choose a configured source and a JPEG, PNG, MP4, or MOV file.");
+      notifyErrorMessage("Choose a configured source and a JPEG, PNG, MP4, or MOV file.");
       return;
     }
 
@@ -617,12 +673,12 @@ function App() {
       const data = new FormData();
       data.append("file", file);
       const job = await request<Job>(role, `/api/v1/media-jobs?source_id=${encodeURIComponent(sourceId)}`, { method: "POST", body: data });
-      setNotice(`Processing job created: ${job.message}`);
+      notifySuccess(`Processing job created: ${job.message}`);
       setFile(null);
       await loadForRole(role);
       navigate("media");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to submit the media job.");
+      notifyError(error, "Unable to submit the media job.");
     } finally {
       setLoading(false);
     }
@@ -636,7 +692,7 @@ function App() {
     try {
       setFrames(await request<FrameSummary[]>(role, `/api/v1/media-jobs/${job.id}/frames`));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Frame summaries are unavailable.");
+      notifyError(error, "Frame summaries are unavailable.");
     } finally {
       setLoading(false);
     }
@@ -657,7 +713,7 @@ function App() {
         method: "POST",
         body: JSON.stringify({ note: note.trim() || null }),
       });
-      setNotice(
+      notifySuccess(
         action === "resolve"
           ? "Safety alert resolved after human review."
           : action === "cancel"
@@ -666,7 +722,7 @@ function App() {
       );
       await loadForRole(role);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The alert update could not be completed.");
+      notifyError(error, "The alert update could not be completed.");
     } finally {
       setLoading(false);
     }
@@ -684,10 +740,10 @@ function App() {
         body: JSON.stringify({ name: form.get("name"), zone_id: form.get("zone_id"), enabled: true }),
       });
       formElement.reset();
-      setNotice("Camera source configuration created and audited.");
+      notifySuccess("Camera source configuration created and audited.");
       await loadForRole(role);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to create the source.");
+      notifyError(error, "Unable to create the source.");
     } finally {
       setLoading(false);
     }
@@ -705,10 +761,50 @@ function App() {
         body: JSON.stringify({ name: form.get("name"), description: form.get("description"), enabled: true }),
       });
       formElement.reset();
-      setNotice("Safety zone and initial policy created and audited.");
+      notifySuccess("Safety zone and initial policy created and audited.");
       await loadForRole(role);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to create the safety zone.");
+      notifyError(error, "Unable to create the safety zone.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateSource = async (event: FormEvent<HTMLFormElement>, sourceId: string) => {
+    event.preventDefault();
+    if (!role) return;
+    const form = new FormData(event.currentTarget);
+    setLoading(true);
+    try {
+      await request<Source>(role, `/api/v1/sources/${sourceId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: form.get("name"), zone_id: form.get("zone_id") }),
+      });
+      notifySuccess("Camera source configuration updated and audited.");
+      setEditingSourceId(null);
+      await loadForRole(role);
+    } catch (error) {
+      notifyError(error, "Unable to update the source.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateZone = async (event: FormEvent<HTMLFormElement>, zoneId: string) => {
+    event.preventDefault();
+    if (!role) return;
+    const form = new FormData(event.currentTarget);
+    setLoading(true);
+    try {
+      await request<Zone>(role, `/api/v1/zones/${zoneId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: form.get("name"), description: form.get("description") }),
+      });
+      notifySuccess("Safety zone configuration updated and audited.");
+      setEditingZoneId(null);
+      await loadForRole(role);
+    } catch (error) {
+      notifyError(error, "Unable to update the safety zone.");
     } finally {
       setLoading(false);
     }
@@ -721,22 +817,28 @@ function App() {
     const zoneId = String(form.get("zone_id"));
     setLoading(true);
     try {
+      const classConfidenceThresholds: Record<string, number> = {};
+      for (const label of CLASS_THRESHOLD_LABELS) {
+        const raw = form.get(`threshold_${label}`);
+        if (raw !== null && raw !== "") classConfidenceThresholds[label] = Number(raw);
+      }
       await request(role, `/api/v1/zones/${zoneId}/policy`, {
         method: "PATCH",
         body: JSON.stringify({
           helmet_required: form.get("helmet_required") === "on",
           vest_required: form.get("vest_required") === "on",
           confidence_threshold: Number(form.get("confidence_threshold")),
+          class_confidence_thresholds: classConfidenceThresholds,
           persistence_frames: Number(form.get("persistence_frames")),
           deduplication_seconds: Number(form.get("deduplication_seconds")),
           evidence_retention_hours: Number(form.get("evidence_retention_hours")),
           active: true,
         }),
       });
-      setNotice("New immutable zone policy version created and activated.");
+      notifySuccess("New immutable zone policy version created and activated.");
       await loadForRole(role);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to create the policy version.");
+      notifyError(error, "Unable to create the policy version.");
     } finally {
       setLoading(false);
     }
@@ -748,7 +850,7 @@ function App() {
     try {
       setEvaluations(await request<ModelEvaluation[]>(role, "/api/v1/model-evaluations"));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Model evaluations are unavailable.");
+      notifyError(error, "Model evaluations are unavailable.");
     } finally {
       setLoading(false);
     }
@@ -760,7 +862,7 @@ function App() {
     try {
       setAuditEvents(await request<AuditEvent[]>(role, "/api/v1/audit-events"));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Audit records are unavailable.");
+      notifyError(error, "Audit records are unavailable.");
     } finally {
       setLoading(false);
     }
@@ -772,7 +874,7 @@ function App() {
     try {
       setUsers(await request<PlatformUser[]>(role, "/api/v1/users"));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Role assignments are unavailable.");
+      notifyError(error, "Role assignments are unavailable.");
     } finally {
       setLoading(false);
     }
@@ -790,10 +892,10 @@ function App() {
         body: JSON.stringify({ auth_subject: form.get("auth_subject"), role: form.get("role"), enabled: true }),
       });
       formElement.reset();
-      setNotice("Role assignment created and audited.");
+      notifySuccess("Role assignment created and audited.");
       await loadUsers();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to create the role assignment.");
+      notifyError(error, "Unable to create the role assignment.");
     } finally {
       setLoading(false);
     }
@@ -804,10 +906,10 @@ function App() {
     setLoading(true);
     try {
       await request<PlatformUser>(role, `/api/v1/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ role: nextRole }) });
-      setNotice(`Role updated for ${user.auth_subject}.`);
+      notifySuccess(`Role updated for ${user.auth_subject}.`);
       await loadUsers();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to update this role assignment.");
+      notifyError(error, "Unable to update this role assignment.");
     } finally {
       setLoading(false);
     }
@@ -818,10 +920,10 @@ function App() {
     setLoading(true);
     try {
       await request<PlatformUser>(role, `/api/v1/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !user.enabled }) });
-      setNotice(user.enabled ? `Access disabled for ${user.auth_subject}.` : `Access re-enabled for ${user.auth_subject}.`);
+      notifySuccess(user.enabled ? `Access disabled for ${user.auth_subject}.` : `Access re-enabled for ${user.auth_subject}.`);
       await loadUsers();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to update this role assignment.");
+      notifyError(error, "Unable to update this role assignment.");
     } finally {
       setLoading(false);
     }
@@ -833,7 +935,7 @@ function App() {
     try {
       setRetentionSettings(await request<RetentionSettings>(role, "/api/v1/settings/retention"));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Retention settings are unavailable.");
+      notifyError(error, "Retention settings are unavailable.");
     } finally {
       setLoading(false);
     }
@@ -854,9 +956,9 @@ function App() {
           }),
         }),
       );
-      setNotice("Retention settings updated and audited.");
+      notifySuccess("Retention settings updated and audited.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to update retention settings.");
+      notifyError(error, "Unable to update retention settings.");
     } finally {
       setLoading(false);
     }
@@ -868,7 +970,7 @@ function App() {
     try {
       setInferenceSettings(await request<InferenceSettings>(role, "/api/v1/settings/inference"));
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Inference provider configuration is unavailable.");
+      notifyError(error, "Inference provider configuration is unavailable.");
     } finally {
       setLoading(false);
     }
@@ -893,9 +995,9 @@ function App() {
           }),
         }),
       );
-      setNotice("Inference provider configuration updated and audited.");
+      notifySuccess("Inference provider configuration updated and audited.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to update the inference provider configuration.");
+      notifyError(error, "Unable to update the inference provider configuration.");
     } finally {
       setLoading(false);
     }
@@ -906,9 +1008,9 @@ function App() {
     setLoading(true);
     try {
       await request<Alert>(role, `/api/v1/alerts/${alert.id}/evidence/approve-demo`, { method: "POST" });
-      setNotice("Evidence approved for demonstration-viewer access.");
+      notifySuccess("Evidence approved for demonstration-viewer access.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to approve this evidence for demonstration viewing.");
+      notifyError(error, "Unable to approve this evidence for demonstration viewing.");
     } finally {
       setLoading(false);
     }
@@ -919,14 +1021,11 @@ function App() {
     setLoading(true);
     try {
       const updated = await request<Alert>(role, `/api/v1/alerts/${alert.id}/evidence/retry`, { method: "POST" });
-      setNotice(
-        updated.evidence_available
-          ? "Privacy-processed evidence generated successfully."
-          : "Evidence is still unavailable; mandatory privacy processing did not complete.",
-      );
+      if (updated.evidence_available) notifySuccess("Privacy-processed evidence generated successfully.");
+      else notifyInfo("Evidence is still unavailable; mandatory privacy processing did not complete.");
       await loadForRole(role);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unable to retry evidence generation for this alert.");
+      notifyError(error, "Unable to retry evidence generation for this alert.");
     } finally {
       setLoading(false);
     }
@@ -958,9 +1057,9 @@ function App() {
       anchor.download = "aggregate-compliance-report.csv";
       anchor.click();
       URL.revokeObjectURL(url);
-      setNotice("Aggregate-only CSV export created and audited.");
+      notifySuccess("Aggregate-only CSV export created and audited.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The aggregate export could not be generated.");
+      notifyError(error, "The aggregate export could not be generated.");
     } finally {
       setLoading(false);
     }
@@ -978,6 +1077,11 @@ function App() {
   const renderDashboard = () => (
     <>
       <PageHeader title="Aggregate safety dashboard" description="Safety compliance rates are calculated as compliant ÷ (compliant + non-compliant). Unknown observations are displayed separately and excluded from the headline denominator." />
+      <p className="muted live-status" aria-live="polite">
+        {jobsInFlight
+          ? <><span className="live-dot" aria-hidden="true" /> Live — refreshing every 3 seconds while clips are processing.</>
+          : lastUpdatedAt ? `Last updated ${lastUpdatedAt.toLocaleTimeString()}. No clips currently processing.` : "Loading…"}
+      </p>
       <section className="panel filter-panel" aria-label="Dashboard filters">
         <label>Zone
           <select
@@ -1007,7 +1111,7 @@ function App() {
           </select>
         </label>
         {(dashboardFilters.zoneId || dashboardFilters.sourceId || dashboardFilters.shift) && (
-          <button className="secondary-button" type="button" onClick={() => updateDashboardFilters({ zoneId: "", sourceId: "", shift: "" })}>
+          <button className="secondary-button" type="button" onClick={() => updateDashboardFilters(EMPTY_DASHBOARD_FILTERS)}>
             Clear filters
           </button>
         )}
@@ -1052,6 +1156,35 @@ function App() {
           {["hse_manager", "administrator", "governance_reviewer"].includes(role) && <button type="button" onClick={() => void exportAggregate()}>Export aggregate report</button>}
         </article>
       </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <h2>Recent alert log &amp; annotated evidence inspector</h2>
+            <p className="muted">The five most recent detect → alert → evidence-snapshot events. Evidence images are face-blurred before they can ever be stored.</p>
+          </div>
+          {allowedNavigation.some((item) => item.view === "alerts") && (
+            <button className="secondary-button" type="button" onClick={() => navigate("alerts")}>Open full alert queue</button>
+          )}
+        </div>
+        {alerts.length === 0 ? <EmptyState title="No safety alerts" text="No sustained PPE non-compliance alerts have been created in this POC session." /> : <div className="alerts">
+          {[...alerts]
+            .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+            .slice(0, 5)
+            .map((alert) => <article className="alert" key={alert.id}>
+              <div>
+                <Status status={alert.status} />
+                <p className="event-type">{alert.event_type}</p>
+                <h3>{alert.failed_requirement}</h3>
+                <p>Confidence: {(alert.confidence * 100).toFixed(0)}% · {formatDate(alert.created_at)} · Confirmed observations: {alert.occurrence_count}</p>
+                <p className="muted">{alert.evidence_message}</p>
+                {alert.evidence_available ? <EvidenceLink alertId={alert.id} role={role} onError={notifyErrorMessage} /> : <EvidenceExpired />}
+                {role !== "demonstration_viewer" && <RuleExplanation alertId={alert.id} role={role} onError={notifyErrorMessage} />}
+                {alert.acknowledgement_note && <p><strong>Intervention:</strong> {alert.acknowledgement_note}</p>}
+                {alert.resolution_note && <p><strong>Resolution:</strong> {alert.resolution_note}</p>}
+              </div>
+            </article>)}
+        </div>}
+      </section>
     </>
   );
 
@@ -1061,13 +1194,28 @@ function App() {
       {selectedJob && <section className="panel detail-panel">
         <div className="panel-heading"><div><h2>{selectedJob.filename}</h2><p className="muted">Privacy-safe sampled-frame summaries only.</p></div><button className="secondary-button" type="button" onClick={() => setSelectedJob(null)}>Close detail</button></div>
         {role && (selectedJob.preview_available
-          ? <JobPreviewLink jobId={selectedJob.id} role={role} onError={setNotice} />
+          ? <JobPreviewLink jobId={selectedJob.id} role={role} onError={notifyErrorMessage} />
           : <EmptyState title="No preview available" text="A face-blurred preview is generated for every completed job; this one hasn't finished processing yet, its preview expired, or mandatory privacy processing could not run." />)}
         <div className="metrics compact-metrics">
           <Metric label="Compliant" value={selectedJob.compliant_count} />
           <Metric label="Non-compliant" value={selectedJob.non_compliant_count} />
           <Metric label="Unknown" value={selectedJob.unknown_count} />
         </div>
+        {Object.keys(jobConfidenceSummary).length > 0 && (
+          <div className="confidence-summary">
+            <h3>Detection confidence (whole job)</h3>
+            <ul className="confidence-list">
+              {Object.entries(jobConfidenceSummary).map(([label, stats]) => (
+                <li key={label}>
+                  <span className="confidence-label">{label}</span>
+                  <span className="muted"> · {stats.count} detection{stats.count === 1 ? "" : "s"} · </span>
+                  <span className="confidence-range">{(stats.min_confidence * 100).toFixed(0)}%–{(stats.max_confidence * 100).toFixed(0)}%</span>
+                </li>
+              ))}
+            </ul>
+            <p className="muted">Range across every sampled frame in this job. A rule only fires as a violation once its zone's configured confidence threshold is cleared -- see the Zones page.</p>
+          </div>
+        )}
         <p className="muted">
           These totals count only <strong>persistent</strong> violations -- a requirement failing across this
           zone's configured number of consecutive sampled frames. The table below shows each individual sampled
@@ -1075,8 +1223,17 @@ function App() {
           the totals above (a single-image upload has exactly one frame, so it can never reach a multi-frame
           threshold on its own). Both are correct; they answer different questions.
         </p>
-        {frames.length ? <table><thead><tr><th>Frame</th><th>Observed population</th><th>Compliant</th><th>Non-compliant</th><th>Unknown</th></tr></thead><tbody>
-          {frames.map((frame) => <tr key={frame.frame_index}><td>{frame.frame_index}</td><td>{frame.person_count}</td><td>{frame.compliant_count}</td><td>{frame.non_compliant_count}</td><td>{frame.unknown_count}</td></tr>)}
+        {frames.length ? <table><thead><tr><th>Frame</th><th>Observed population</th><th>Compliant</th><th>Non-compliant</th><th>Unknown</th><th>Confidence by class</th></tr></thead><tbody>
+          {frames.map((frame) => <tr key={frame.frame_index}>
+            <td>{frame.frame_index}</td>
+            <td>{frame.person_count}</td>
+            <td>{frame.compliant_count}</td>
+            <td>{frame.non_compliant_count}</td>
+            <td>{frame.unknown_count}</td>
+            <td>{Object.entries(frame.confidence_summary).length
+              ? Object.entries(frame.confidence_summary).map(([label, stats]) => `${label} ${(stats.min_confidence * 100).toFixed(0)}–${(stats.max_confidence * 100).toFixed(0)}%`).join(", ")
+              : "—"}</td>
+          </tr>)}
         </tbody></table> : <EmptyState title="No frame observations" text="Frame summaries become available after media processing begins." />}
       </section>}
       <section className="panel">
@@ -1084,7 +1241,7 @@ function App() {
         {jobs.length === 0 ? <EmptyState title="No media jobs" text="Create a private processing job to demonstrate the upload-to-review workflow." /> : <div className="jobs">
           {jobs.map((job) => <article className="job" key={job.id}>
             <div><Status status={job.status} /><h3>{job.filename}</h3><p>{sources.find((source) => source.id === job.source_id)?.name ?? "Unknown source"} · {formatDate(job.submitted_at)} · Compliant: {job.compliant_count} · Non-compliant: {job.non_compliant_count} · Unknown: {job.unknown_count}</p><p className="muted">{job.message}</p></div>
-            <div className="button-row"><button className="secondary-button" type="button" onClick={() => void openJob(job)}>View summary</button>{["queued", "validating", "processing"].includes(job.status) && <button type="button" onClick={() => void cancelJob(role, job, loadForRole, setNotice, setLoading)}>Cancel</button>}{job.status === "failed" && <button type="button" onClick={() => void retryJob(role, job, loadForRole, setNotice, setLoading)}>Retry</button>}</div>
+            <div className="button-row"><button className="secondary-button" type="button" onClick={() => void openJob(job)}>View summary</button>{["queued", "validating", "processing"].includes(job.status) && <button type="button" onClick={() => void cancelJob(role, job, loadForRole, notifyInfo, notifyError, setLoading)}>Cancel</button>}{job.status === "failed" && <button type="button" onClick={() => void retryJob(role, job, loadForRole, notifyInfo, notifyError, setLoading)}>Retry</button>}</div>
           </article>)}
         </div>}
       </section>
@@ -1116,6 +1273,57 @@ function App() {
   const renderAlerts = () => (
     <>
       <PageHeader title="Safety alert queue" description="Every alert is a human-review safety signal. It does not identify, profile, rank, or discipline any person." />
+      <section className="panel filter-panel" aria-label="Alert queue filters">
+        <label>Zone
+          <select
+            value={dashboardFilters.zoneId}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, zoneId: event.target.value })}
+          >
+            <option value="">All zones</option>
+            {zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}
+          </select>
+        </label>
+        <label>Status
+          <select
+            value={dashboardFilters.alertStatus}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, alertStatus: event.target.value })}
+          >
+            <option value="">All statuses</option>
+            {ALERT_STATUS_OPTIONS.map((status) => <option key={status} value={status}>{status}</option>)}
+          </select>
+        </label>
+        <label>From
+          <input
+            type="date"
+            value={dashboardFilters.alertStartDate}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, alertStartDate: event.target.value })}
+          />
+        </label>
+        <label>To
+          <input
+            type="date"
+            value={dashboardFilters.alertEndDate}
+            onChange={(event) => updateDashboardFilters({ ...dashboardFilters, alertEndDate: event.target.value })}
+          />
+        </label>
+        {(dashboardFilters.zoneId || dashboardFilters.alertStatus || dashboardFilters.alertStartDate || dashboardFilters.alertEndDate) && (
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => updateDashboardFilters({ ...dashboardFilters, zoneId: "", alertStatus: "", alertStartDate: "", alertEndDate: "" })}
+          >
+            Clear filters
+          </button>
+        )}
+        {dashboardFilters.sourceId && (
+          <p className="muted">
+            Also scoped to the camera filter set on the Dashboard page.{" "}
+            <button className="text-button" type="button" onClick={() => updateDashboardFilters({ ...dashboardFilters, sourceId: "" })}>
+              Clear camera filter
+            </button>
+          </p>
+        )}
+      </section>
       <section className="panel">
         {alerts.length === 0 ? <EmptyState title="No safety alerts" text="No sustained PPE non-compliance alerts have been created in this POC session." /> : <div className="alerts">
           {alerts.map((alert) => <article className="alert" key={alert.id}>
@@ -1124,7 +1332,7 @@ function App() {
               <h3>{alert.failed_requirement}</h3>
               <p>Confidence: {(alert.confidence * 100).toFixed(0)}% · {formatDate(alert.created_at)} · Confirmed observations: {alert.occurrence_count}</p>
               <p className="muted">{alert.evidence_message}</p>
-              {alert.evidence_available ? <EvidenceLink alertId={alert.id} role={role} onError={setNotice} /> : <EvidenceExpired />}
+              {alert.evidence_available ? <EvidenceLink alertId={alert.id} role={role} onError={notifyErrorMessage} /> : <EvidenceExpired />}
               {alert.acknowledgement_note && <p><strong>Intervention:</strong> {alert.acknowledgement_note}</p>}
               {alert.resolution_note && <p><strong>Resolution:</strong> {alert.resolution_note}</p>}
             </div>
@@ -1145,7 +1353,26 @@ function App() {
     <>
       <PageHeader title="Camera source configuration" description="Sources are manual-upload labels for the POC. They do not enable live feeds, access control, or person tracking." />
       <section className="grid">
-        <article className="panel"><h2>Configured sources</h2>{sources.length ? <table><thead><tr><th>Name</th><th>Zone</th></tr></thead><tbody>{sources.map((source) => <tr key={source.id}><td>{source.name}</td><td>{zones.find((zone) => zone.id === source.zone_id)?.name ?? "Unavailable zone"}</td></tr>)}</tbody></table> : <EmptyState title="No sources configured" text="Create a source before submitting POC media." />}</article>
+        <article className="panel"><h2>Configured sources</h2>{sources.length ? <table><thead><tr><th>Name</th><th>Zone</th><th></th></tr></thead><tbody>{sources.map((source) => editingSourceId === source.id ? (
+          <tr key={source.id}>
+            <td colSpan={3}>
+              <form className="inline-edit-form" onSubmit={(event) => void updateSource(event, source.id)}>
+                <input name="name" required minLength={3} maxLength={120} defaultValue={source.name} />
+                <select name="zone_id" required defaultValue={source.zone_id}>
+                  {zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}
+                </select>
+                <button disabled={loading} type="submit">Save</button>
+                <button className="secondary-button" type="button" onClick={() => setEditingSourceId(null)}>Cancel</button>
+              </form>
+            </td>
+          </tr>
+        ) : (
+          <tr key={source.id}>
+            <td>{source.name}</td>
+            <td>{zones.find((zone) => zone.id === source.zone_id)?.name ?? "Unavailable zone"}</td>
+            <td><button className="text-button" type="button" onClick={() => setEditingSourceId(source.id)}>Edit</button></td>
+          </tr>
+        ))}</tbody></table> : <EmptyState title="No sources configured" text="Create a source before submitting POC media." />}</article>
         <article className="panel"><h2>Add source</h2><form onSubmit={createSource}><label>Name<input name="name" required minLength={3} maxLength={120} /></label><label>Safety zone<select name="zone_id" required><option value="">Choose zone</option>{zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></label><button disabled={loading} type="submit">Create source</button></form></article>
       </section>
     </>
@@ -1155,7 +1382,25 @@ function App() {
     <>
       <PageHeader title="Safety zone configuration" description="Zones define safety context and versioned PPE policy. They contain no employee, identity, or biometric data." />
       <section className="grid">
-        <article className="panel"><h2>Configured zones</h2>{zones.length ? <table><thead><tr><th>Zone</th><th>Policy</th><th>Persistence</th></tr></thead><tbody>{zones.map((zone) => <tr key={zone.id}><td><strong>{zone.name}</strong><br /><span className="muted">{zone.description}</span></td><td>v{zone.policy.version}: {zone.policy.helmet_required ? "Helmet" : "No helmet rule"} · {zone.policy.vest_required ? "Vest" : "No vest rule"}</td><td>{zone.policy.persistence_frames} frames</td></tr>)}</tbody></table> : <EmptyState title="No zones configured" text="Create a safety zone to begin policy configuration." />}</article>
+        <article className="panel"><h2>Configured zones</h2>{zones.length ? <table><thead><tr><th>Zone</th><th>Policy</th><th>Persistence</th><th></th></tr></thead><tbody>{zones.map((zone) => editingZoneId === zone.id ? (
+          <tr key={zone.id}>
+            <td colSpan={4}>
+              <form className="inline-edit-form" onSubmit={(event) => void updateZone(event, zone.id)}>
+                <input name="name" required minLength={3} maxLength={120} defaultValue={zone.name} />
+                <textarea name="description" required minLength={3} maxLength={1000} defaultValue={zone.description} />
+                <button disabled={loading} type="submit">Save</button>
+                <button className="secondary-button" type="button" onClick={() => setEditingZoneId(null)}>Cancel</button>
+              </form>
+            </td>
+          </tr>
+        ) : (
+          <tr key={zone.id}>
+            <td><strong>{zone.name}</strong><br /><span className="muted">{zone.description}</span></td>
+            <td>v{zone.policy.version}: {zone.policy.helmet_required ? "Helmet" : "No helmet rule"} · {zone.policy.vest_required ? "Vest" : "No vest rule"}</td>
+            <td>{zone.policy.persistence_frames} frames</td>
+            <td><button className="text-button" type="button" onClick={() => setEditingZoneId(zone.id)}>Edit</button></td>
+          </tr>
+        ))}</tbody></table> : <EmptyState title="No zones configured" text="Create a safety zone to begin policy configuration." />}</article>
         <article className="panel"><h2>Add safety zone</h2><form onSubmit={createZone}><label>Name<input name="name" required minLength={3} maxLength={120} /></label><label>Description<textarea name="description" required minLength={3} maxLength={1000} /></label><button disabled={loading} type="submit">Create zone</button></form></article>
       </section>
     </>
@@ -1166,7 +1411,39 @@ function App() {
       <PageHeader title="Versioned PPE policies" description="Creating a policy produces a new immutable version. Configuration defaults are explicit and are not treated as a disciplinary rule." />
       <section className="grid">
         <article className="panel"><h2>Active policies</h2>{zones.map((zone) => <div className="policy policy-row" key={zone.id}><strong>{zone.name} · version {zone.policy.version}</strong><span>Helmet: {zone.policy.helmet_required ? "required" : "not required"}</span><span>Vest: {zone.policy.vest_required ? "required" : "not required"}</span><span>Persistence: {zone.policy.persistence_frames} frames · Deduplication: {zone.policy.deduplication_seconds}s</span></div>)}</article>
-        <article className="panel"><h2>Create policy version</h2><form onSubmit={createPolicy}><label>Safety zone<select name="zone_id" required><option value="">Choose zone</option>{zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></label><label className="check-label"><input name="helmet_required" type="checkbox" defaultChecked /> Helmet required</label><label className="check-label"><input name="vest_required" type="checkbox" defaultChecked /> Hi-vis vest required</label><label>Confidence threshold<input name="confidence_threshold" type="number" min="0" max="1" step="0.01" defaultValue="0.25" required /></label><label>Persistence frames<input name="persistence_frames" type="number" min="1" max="60" defaultValue="3" required /></label><label>Deduplication seconds<input name="deduplication_seconds" type="number" min="0" max="86400" defaultValue="60" required /></label><label>Evidence retention hours<input name="evidence_retention_hours" type="number" min="24" max="72" defaultValue="48" required /></label><button disabled={loading} type="submit">Create and activate version</button></form></article>
+        <article className="panel">
+          <h2>Create policy version</h2>
+          <form onSubmit={createPolicy}>
+            <label>Safety zone<select name="zone_id" required><option value="">Choose zone</option>{zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.name}</option>)}</select></label>
+            <label className="check-label"><input name="helmet_required" type="checkbox" defaultChecked /> Helmet required</label>
+            <label className="check-label"><input name="vest_required" type="checkbox" defaultChecked /> Hi-vis vest required</label>
+            <label>Confidence threshold<input name="confidence_threshold" type="number" min="0" max="1" step="0.01" defaultValue="0.25" required /></label>
+            <fieldset className="threshold-overrides">
+              <legend>Per-class confidence overrides (optional)</legend>
+              <p className="muted">
+                Leave a field blank to use the flat confidence threshold above for that class. Raising the
+                threshold for a negative class (e.g. no_helmet, no_vest) reduces false-positive violations
+                from a single weak detection outweighing a much stronger correct one for the same person.
+              </p>
+              <div className="threshold-grid">
+                {CLASS_THRESHOLD_LABELS.map((label) => (
+                  <label key={label}>{label}
+                    <input name={`threshold_${label}`} type="number" min="0" max="1" step="0.01" placeholder="uses flat threshold" />
+                  </label>
+                ))}
+              </div>
+              <p className="muted">
+                gloves and glasses have no effect yet: no currently licensable model outputs these classes
+                (see the Model registry's limitations for the primary model for why). Setting a threshold here
+                does not enable detection.
+              </p>
+            </fieldset>
+            <label>Persistence frames<input name="persistence_frames" type="number" min="1" max="60" defaultValue="3" required /></label>
+            <label>Deduplication seconds<input name="deduplication_seconds" type="number" min="0" max="86400" defaultValue="60" required /></label>
+            <label>Evidence retention hours<input name="evidence_retention_hours" type="number" min="24" max="72" defaultValue="48" required /></label>
+            <button disabled={loading} type="submit">Create and activate version</button>
+          </form>
+        </article>
       </section>
     </>
   );
@@ -1310,7 +1587,13 @@ function App() {
       </aside>
       <main className="content">
         <header className="topbar"><div><span className="role-badge">{ROLE_LABELS[role]}</span><p className="muted">Authenticated POC view; permissions are enforced by the API.</p></div><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadForRole(role)}>{loading ? "Refreshing…" : "Refresh"}</button></header>
-        <section className="notice" aria-live="polite">{notice}</section>
+        <section
+          className={`notice notice-${noticeKind}`}
+          role={noticeKind === "error" ? "alert" : "status"}
+          aria-live={noticeKind === "error" ? "assertive" : "polite"}
+        >
+          {notice}
+        </section>
         {pages[activeView]()}
         <footer className="safety-footer">{SAFETY_NOTICE}</footer>
       </main>
@@ -1346,6 +1629,60 @@ function EmptyState({ title, text }: { title: string; text: string }) {
 function EvidenceExpired() {
   /** Render the configured retention state when evidence cannot be displayed safely. */
   return <div className="evidence-expired"><strong>Evidence expired</strong><span>This evidence is no longer available under the configured retention policy.</span></div>;
+}
+
+type RuleResult = {
+  id: string;
+  requirement: string;
+  persistent: boolean;
+  non_compliant_count: number;
+  confidence: number | null;
+  created_at: string;
+};
+
+// PUBLIC_INTERFACE
+function RuleExplanation({ alertId, role, onError }: { alertId: string; role: Role; onError: (message: string) => void }) {
+  /** Explain, from durable per-frame rule-evaluation records, exactly why this alert fired. */
+  const [results, setResults] = useState<RuleResult[] | null>(null);
+  const [open, setOpen] = useState(false);
+
+  const loadResults = async () => {
+    setOpen(true);
+    if (results !== null) return;
+    try {
+      setResults(await request<RuleResult[]>(role, `/api/v1/alerts/${alertId}/rule-results`));
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Unable to load the rule explanation for this alert.");
+      setOpen(false);
+    }
+  };
+
+  if (!open) return <button className="text-button" type="button" aria-expanded="false" onClick={() => void loadResults()}>Why was this flagged?</button>;
+  return (
+    <div className="rule-explanation">
+      <div className="panel-heading">
+        <h4>Why this alert fired</h4>
+        <button className="text-button" type="button" aria-expanded="true" onClick={() => setOpen(false)}>Hide</button>
+      </div>
+      {results === null ? <p className="muted">Loading rule evaluations…</p> : results.length === 0 ? (
+        <p className="muted">No durable rule-evaluation records exist for this alert.</p>
+      ) : (
+        <table>
+          <thead><tr><th>When</th><th>Requirement</th><th>Persistent</th><th>Peak violating count</th><th>Confidence</th></tr></thead>
+          <tbody>
+            {results.map((result) => <tr key={result.id}>
+              <td>{formatDate(result.created_at)}</td>
+              <td>{result.requirement}</td>
+              <td>{result.persistent ? "Yes -- met this zone's persistence threshold" : "Not yet -- held for future frames"}</td>
+              <td>{result.non_compliant_count}</td>
+              <td>{result.confidence === null ? "--" : `${(result.confidence * 100).toFixed(0)}%`}</td>
+            </tr>)}
+          </tbody>
+        </table>
+      )}
+      <p className="muted">Each row is a durable record of one job's evaluation against this exact rule -- including jobs that only merged into this alert's occurrence count without creating it.</p>
+    </div>
+  );
 }
 
 // PUBLIC_INTERFACE
@@ -1408,16 +1745,17 @@ const cancelJob = async (
   role: Role,
   job: Job,
   refresh: (activeRole: Role) => Promise<void>,
-  setNotice: (value: string) => void,
+  notifyInfo: (value: string) => void,
+  notifyError: (error: unknown, fallback: string) => void,
   setLoading: (value: boolean) => void,
 ) => {
   setLoading(true);
   try {
     await request<Job>(role, `/api/v1/media-jobs/${job.id}/cancel`, { method: "POST" });
-    setNotice("Pending media job cancelled before finalizing a safety result.");
+    notifyInfo("Pending media job cancelled before finalizing a safety result.");
     await refresh(role);
   } catch (error) {
-    setNotice(error instanceof Error ? error.message : "Unable to cancel the pending media job.");
+    notifyError(error, "Unable to cancel the pending media job.");
   } finally {
     setLoading(false);
   }
@@ -1427,16 +1765,17 @@ const retryJob = async (
   role: Role,
   job: Job,
   refresh: (activeRole: Role) => Promise<void>,
-  setNotice: (value: string) => void,
+  notifyInfo: (value: string) => void,
+  notifyError: (error: unknown, fallback: string) => void,
   setLoading: (value: boolean) => void,
 ) => {
   setLoading(true);
   try {
     await request<Job>(role, `/api/v1/media-jobs/${job.id}/retry`, { method: "POST" });
-    setNotice("Failed media job re-queued for retry.");
+    notifyInfo("Failed media job re-queued for retry.");
     await refresh(role);
   } catch (error) {
-    setNotice(error instanceof Error ? error.message : "Unable to retry this media job.");
+    notifyError(error, "Unable to retry this media job.");
   } finally {
     setLoading(false);
   }

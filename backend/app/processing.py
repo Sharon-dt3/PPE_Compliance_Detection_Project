@@ -11,6 +11,7 @@ from typing import Callable, Protocol
 
 from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import record_audit_event
@@ -21,6 +22,7 @@ from app.detection import DetectedObject, DetectionOutcome, get_detection_provid
 from app.evidence import EvidenceService, PrivacyProcessingError
 from app.logging_config import get_correlation_id, set_correlation_id
 from app.models import (
+    AlertEventType,
     CameraSource,
     ComplianceAlert,
     EvidenceSnapshot,
@@ -269,69 +271,122 @@ def _create_or_update_alert(
     requirement_decision: RequirementDecision,
     now: datetime,
 ) -> None:
-    """Create one requirement's alert, or merge into its existing deduplication window."""
+    """Create one requirement's alert, or merge into its existing deduplication window.
+
+    Two jobs from the same source/policy/requirement can finish processing at nearly the
+    same moment (real Celery concurrency, or a live-capture burst across sources). Each
+    holds its own long-lived transaction, so the lookup below cannot see another job's
+    still-uncommitted insert -- both would otherwise conclude "no existing alert" and each
+    create one, producing duplicates. ``ix_compliance_alerts_dedup_active`` (a partial
+    unique index on ``deduplication_key`` for open/acknowledged alerts) makes the database
+    the tiebreaker: the losing transaction's insert is rejected, caught here, and merged
+    into the winner instead -- the database, not application code, decides who wins.
+    """
     deduplication_key = f"{job.source_id}:{policy.id}:{requirement_decision.requirement}"
     window_start = now - timedelta(seconds=policy.deduplication_seconds)
-    alert = session.scalar(
-        select(ComplianceAlert)
-        .where(
-            ComplianceAlert.deduplication_key == deduplication_key,
-            ComplianceAlert.last_observed_at >= window_start,
-            ComplianceAlert.status.in_(["open", "acknowledged"]),
-        )
-        .order_by(ComplianceAlert.last_observed_at.desc())
-    )
-    if alert is not None:
-        alert.last_observed_at = now
-        alert.occurrence_count += 1
-        alert.confidence = max(alert.confidence, requirement_decision.confidence or 0)
-        _record_rule_result(session, alert, job, policy, requirement_decision)
-        record_audit_event(
-            session,
-            "alert.deduplicated",
-            "compliance_alert",
-            alert.id,
-            "processing-worker",
-            "system",
-            "Repeated policy evidence merged.",
-        )
-        return
 
-    alert = ComplianceAlert(
-        job_id=job.id,
-        source_id=job.source_id,
-        zone_id=job.zone_id,
-        policy_id=policy.id,
-        deduplication_key=deduplication_key,
-        failed_requirement=requirement_decision.requirement,
-        confidence=requirement_decision.confidence or 0,
-        first_observed_at=now,
-        last_observed_at=now,
-        evidence_available=False,
-        evidence_message="Evidence is being prepared by the required privacy gate.",
-    )
-    session.add(alert)
-    session.flush()
+    def find_existing() -> ComplianceAlert | None:
+        """Fast-path heuristic: an alert for this rule, recently observed."""
+        return session.scalar(
+            select(ComplianceAlert)
+            .where(
+                ComplianceAlert.deduplication_key == deduplication_key,
+                ComplianceAlert.last_observed_at >= window_start,
+                ComplianceAlert.status.in_(["open", "acknowledged"]),
+            )
+            .order_by(ComplianceAlert.last_observed_at.desc())
+        )
+
+    def find_active_alert() -> ComplianceAlert | None:
+        """Any open/acknowledged alert for this dedup key, regardless of staleness --
+        exactly what ``ix_compliance_alerts_dedup_active`` enforces uniqueness over. A
+        rejected insert can only ever collide with a row this finds (the fast-path lookup's
+        time window can miss a long-open, never-acknowledged alert), so this is the only
+        lookup safe to use when recovering from that rejection."""
+        return session.scalar(
+            select(ComplianceAlert)
+            .where(
+                ComplianceAlert.deduplication_key == deduplication_key,
+                ComplianceAlert.status.in_(["open", "acknowledged"]),
+            )
+            .order_by(ComplianceAlert.last_observed_at.desc())
+        )
+
+    alert = find_existing()
+    if alert is None:
+        candidate = ComplianceAlert(
+            job_id=job.id,
+            source_id=job.source_id,
+            zone_id=job.zone_id,
+            policy_id=policy.id,
+            deduplication_key=deduplication_key,
+            event_type=AlertEventType.PPE_NON_COMPLIANCE.value,
+            failed_requirement=requirement_decision.requirement,
+            confidence=requirement_decision.confidence or 0,
+            first_observed_at=now,
+            last_observed_at=now,
+            evidence_available=False,
+            evidence_message="Evidence is being prepared by the required privacy gate.",
+        )
+        try:
+            with session.begin_nested():
+                session.add(candidate)
+                session.flush()
+        except IntegrityError:
+            # Another job already holds the one active alert this dedup key allows -- either
+            # a genuine concurrent winner, or a long-open alert outside the fast-path window.
+            # Merge into it either way rather than crash the job.
+            alert = find_active_alert()
+            if alert is None:
+                raise
+        else:
+            _record_rule_result(session, candidate, job, policy, requirement_decision)
+            record_audit_event(
+                session,
+                "alert.created",
+                "compliance_alert",
+                candidate.id,
+                "processing-worker",
+                "system",
+                "Persistent non-identifying safety evidence confirmed.",
+            )
+            evidence_objects = detections.frames[-1].objects if detections.frames else ()
+            attempt_evidence_generation(
+                session,
+                candidate,
+                media_path,
+                evidence_objects,
+                requirement_decision.requirement,
+                policy.evidence_retention_hours,
+            )
+            return
+
+    alert.last_observed_at = now
+    alert.occurrence_count += 1
+    new_confidence = requirement_decision.confidence or 0
+    is_strongest_occurrence_yet = new_confidence > alert.confidence
+    alert.confidence = max(alert.confidence, new_confidence)
     _record_rule_result(session, alert, job, policy, requirement_decision)
     record_audit_event(
         session,
-        "alert.created",
+        "alert.deduplicated",
         "compliance_alert",
         alert.id,
         "processing-worker",
         "system",
-        "Persistent non-identifying safety evidence confirmed.",
+        "Repeated policy evidence merged.",
     )
 
-    evidence_objects = detections.frames[-1].objects if detections.frames else ()
-    attempt_evidence_generation(
-        session,
-        alert,
-        media_path,
-        evidence_objects,
-        requirement_decision.requirement,
-        policy.evidence_retention_hours,
-    )
+    # The alert's headline confidence is the strongest occurrence ever merged into it, but
+    # evidence was historically captured only once, at creation -- so a supervisor reviewing
+    # a high-confidence alert could be shown a picture of its weakest, earliest occurrence
+    # instead. Refresh the picture whenever a merged occurrence beats what's currently
+    # pictured, so the evidence always matches the strongest violation being reported.
+    if is_strongest_occurrence_yet:
+        evidence_objects = detections.frames[-1].objects if detections.frames else ()
+        refresh_evidence_for_stronger_occurrence(
+            session, alert, media_path, evidence_objects, requirement_decision.requirement, policy.evidence_retention_hours
+        )
 
 
 # PUBLIC_INTERFACE
@@ -390,6 +445,72 @@ def attempt_evidence_generation(
         actor_reference,
         actor_role,
         "Face-blurred evidence created.",
+    )
+    return True
+
+
+# PUBLIC_INTERFACE
+def refresh_evidence_for_stronger_occurrence(
+    session: Session,
+    alert: ComplianceAlert,
+    media_path: str,
+    evidence_objects: tuple[DetectedObject, ...],
+    requirement: str,
+    evidence_retention_hours: int,
+) -> bool:
+    """Replace an alert's evidence with a fresh snapshot from a stronger merged occurrence.
+
+    Runs the exact same fail-closed face-blur pipeline as initial evidence creation. On
+    success, the old blob is deleted and the existing (unique, one-per-alert)
+    ``EvidenceSnapshot`` row is updated in place rather than inserted anew. On a blocked
+    privacy gate, the alert keeps whatever weaker evidence it already had -- a failed
+    refresh must never leave an alert with no evidence at all.
+    """
+    try:
+        storage_key = EvidenceService().create_annotated_blurred_evidence(media_path, evidence_objects, requirement)
+    except PrivacyProcessingError:
+        record_audit_event(
+            session,
+            "evidence.refresh_blocked",
+            "compliance_alert",
+            alert.id,
+            "processing-worker",
+            "system",
+            "A stronger occurrence merged in, but mandatory privacy processing did not complete; existing evidence retained.",
+        )
+        return False
+
+    existing = session.scalar(select(EvidenceSnapshot).where(EvidenceSnapshot.alert_id == alert.id))
+    if existing is None:
+        # No evidence exists yet (an earlier occurrence's own privacy gate had failed) --
+        # this is simply first-time creation, triggered by a later, stronger occurrence.
+        session.add(
+            EvidenceSnapshot(
+                alert_id=alert.id,
+                storage_key=storage_key,
+                blurred=True,
+                expires_at=datetime.now(UTC) + timedelta(hours=evidence_retention_hours),
+            )
+        )
+    else:
+        old_storage_key = existing.storage_key
+        existing.storage_key = storage_key
+        existing.expires_at = datetime.now(UTC) + timedelta(hours=evidence_retention_hours)
+        session.flush()
+        try:
+            EvidenceService().delete(old_storage_key)
+        except OSError:
+            logger.exception("Unable to delete a superseded evidence blob; the private file is now orphaned.")
+    alert.evidence_available = True
+    alert.evidence_message = "Face-blurred evidence is available to authorized reviewers for the configured retention period."
+    record_audit_event(
+        session,
+        "evidence.refreshed",
+        "compliance_alert",
+        alert.id,
+        "processing-worker",
+        "system",
+        "Evidence replaced with a stronger merged occurrence.",
     )
     return True
 

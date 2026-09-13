@@ -337,3 +337,34 @@ def test_demo_viewer_can_see_the_open_alert_count() -> None:
 
     assert response.status_code == 200
     assert isinstance(response.json()["open_count"], int)
+
+
+def test_alert_queue_filters_by_zone_status_and_creation_date() -> None:
+    """The alert list endpoint scopes results by zone, lifecycle status, and creation-date
+    range independently -- the Safety alert queue's filter panel."""
+    with SessionLocal() as session:
+        open_alert_id = _create_alert(session, status="open", evidence_available=False)
+        target_zone_id = session.get(ComplianceAlert, open_alert_id).zone_id
+        resolved_alert_id = _create_alert(session, status="resolved", evidence_available=False)
+
+    with TestClient(app) as client:
+        headers = _demo_headers("safety_supervisor")
+
+        by_zone = client.get("/api/v1/alerts", params={"zone_id": target_zone_id}, headers=headers)
+        assert by_zone.status_code == 200
+        returned_ids = {item["id"] for item in by_zone.json()}
+        assert open_alert_id in returned_ids
+        assert resolved_alert_id not in returned_ids
+
+        by_status = client.get("/api/v1/alerts", params={"status": "resolved"}, headers=headers)
+        assert by_status.status_code == 200
+        returned_ids = {item["id"] for item in by_status.json()}
+        assert resolved_alert_id in returned_ids
+        assert open_alert_id not in returned_ids
+
+        far_future = (datetime.now(UTC) + timedelta(days=365)).isoformat()
+        by_date = client.get("/api/v1/alerts", params={"start_at": far_future}, headers=headers)
+        assert by_date.status_code == 200
+        returned_ids = {item["id"] for item in by_date.json()}
+        assert open_alert_id not in returned_ids
+        assert resolved_alert_id not in returned_ids

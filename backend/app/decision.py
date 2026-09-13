@@ -128,21 +128,16 @@ class SafetyDecisionService:
             for requirement_definition in self._REQUIREMENTS
             if getattr(policy, f"{requirement_definition[0]}_required")
         ]
-        if not requirements:
-            return DecisionOutcome(0, 0, 0, ())
 
         consecutive_failures = {description: 0 for _, _, description in requirements}
         peak_failure_count = {description: 0 for _, _, description in requirements}
         highest_confidence = {description: 0.0 for _, _, description in requirements}
-        latest_compliant = 0
-        latest_unknown = 0
+        latest_person_states: tuple[PersonState, ...] = ()
 
         for frame in detections.frames:
             people = [item for item in frame.objects if item.label == "person" and self._accepted(item, policy)]
             grid = self._evaluate_frame(people, frame.objects, requirements, policy)
-            person_states = self._combine_person_states(grid, len(people), requirements)
-            latest_compliant = sum(1 for state in person_states if state.compliant is True)
-            latest_unknown = sum(1 for state in person_states if state.compliant is None)
+            latest_person_states = self._combine_person_states(grid, len(people), requirements)
 
             for _, _, description in requirements:
                 statuses = grid[description]
@@ -167,12 +162,24 @@ class SafetyDecisionService:
             )
             for _, _, description in requirements
         )
+        persistent_requirements = {decision.requirement for decision in requirement_decisions if decision.persistent}
+
+        # A person violating in the last sampled frame is only represented by
+        # non_compliant_count once their specific requirement has reached persistence.
+        # Before that, they must still be accounted for somewhere in the job-level totals
+        # (otherwise the aggregate silently undercounts the real observed population) --
+        # "detected, but not yet a confirmed violation" is exactly what "unknown" means.
         return DecisionOutcome(
-            compliant_count=latest_compliant,
+            compliant_count=sum(1 for state in latest_person_states if state.compliant is True),
             non_compliant_count=sum(
                 decision.non_compliant_count for decision in requirement_decisions if decision.persistent
             ),
-            unknown_count=latest_unknown,
+            unknown_count=sum(
+                1
+                for state in latest_person_states
+                if state.compliant is None
+                or (state.compliant is False and state.failed_requirement not in persistent_requirements)
+            ),
             requirement_decisions=requirement_decisions,
         )
 

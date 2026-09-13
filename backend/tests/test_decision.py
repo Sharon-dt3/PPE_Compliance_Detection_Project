@@ -50,6 +50,46 @@ def test_missing_positive_ppe_remains_unknown() -> None:
     assert decision.unknown_count == 1
 
 
+def test_zero_requirement_zone_reconciles_against_real_observed_population() -> None:
+    """A zone with no active PPE rule must still report real people as compliant, matching
+    person_states_for_frame's per-frame semantics, instead of hard-zeroing the job totals."""
+    frame = FrameDetections(
+        0,
+        (
+            _object("person", 0.9, (0, 0, 100, 200)),
+            _object("person", 0.9, (150, 0, 250, 200)),
+        ),
+    )
+    policy = _policy(helmet_required=False, vest_required=False)
+    decision = SafetyDecisionService().evaluate(DetectionOutcome((frame,), "test", "1"), policy)
+
+    assert decision.compliant_count == 2
+    assert decision.non_compliant_count == 0
+    assert decision.unknown_count == 0
+
+
+def test_unpersisted_violation_counts_as_unknown_instead_of_vanishing() -> None:
+    """A single-frame violation that cannot yet meet persistence must still be represented
+    in the job-level totals (as unknown, pending confirmation) rather than dropped entirely
+    -- compliant + non_compliant + unknown must reconcile against the real population."""
+    frame = FrameDetections(
+        0,
+        (
+            _object("person", 0.9, (0, 0, 100, 200)),
+            _object("helmet", 0.9, (20, 5, 80, 60)),
+            _object("person", 0.9, (150, 0, 250, 200)),
+            _object("no_helmet", 0.8, (170, 5, 230, 60)),
+        ),
+    )
+    decision = SafetyDecisionService().evaluate(DetectionOutcome((frame,), "test", "1"), _policy(persistence_frames=3))
+
+    assert decision.persistence_met is False
+    assert decision.compliant_count == 1
+    assert decision.non_compliant_count == 0
+    assert decision.unknown_count == 1
+    assert decision.compliant_count + decision.non_compliant_count + decision.unknown_count == 2
+
+
 def test_person_states_for_frame_reports_one_state_per_person_without_identity() -> None:
     """Per-person frame states are ordered by detection only, with no cross-frame identity."""
     frame_objects = (

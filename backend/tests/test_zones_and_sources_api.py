@@ -107,3 +107,38 @@ def test_source_confidence_threshold_override_round_trip() -> None:
         )
         assert cleared.status_code == 200
         assert cleared.json()["confidence_threshold_override"] is None
+
+
+def test_zone_name_and_description_can_be_corrected_without_creating_a_new_zone() -> None:
+    """Fixing a typo in a zone's name/description is a direct update, not a new zone version --
+    distinct from the zone's PPE policy, which stays immutable and versioned separately."""
+    admin = _demo_headers("administrator")
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/zones",
+            headers=admin,
+            json={"name": f"Yrad zone {uuid4()}", "description": "typo'd on creation"},
+        )
+        assert created.status_code == 201
+        zone_id = created.json()["id"]
+        original_policy_version = created.json()["policy"]["version"]
+
+        corrected_name = f"Yard zone {uuid4()}"
+        updated = client.patch(
+            f"/api/v1/zones/{zone_id}",
+            headers=admin,
+            json={"name": corrected_name, "description": "corrected description"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["name"] == corrected_name
+        assert updated.json()["description"] == "corrected description"
+        # Correcting the zone's own fields must never touch its PPE policy version.
+        assert updated.json()["policy"]["version"] == original_policy_version
+
+        rejected_empty = client.patch(f"/api/v1/zones/{zone_id}", headers=admin, json={})
+        assert rejected_empty.status_code == 422
+
+        rejected_role = client.patch(
+            f"/api/v1/zones/{zone_id}", headers=_demo_headers("safety_supervisor"), json={"name": "should not apply"}
+        )
+        assert rejected_role.status_code == 403

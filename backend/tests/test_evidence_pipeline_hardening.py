@@ -15,7 +15,7 @@ import pytest
 from celery.exceptions import SoftTimeLimitExceeded
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.config import settings
 from app.database import SessionLocal, initialise_database
@@ -375,3 +375,37 @@ def test_migration_upgrades_a_legacy_table_and_drops_any_noncompliant_row(tmp_pa
                     "VALUES ('bad2', 'alert-bad2', 'bad2.jpg', 0, '2030-01-01 00:00:00')"
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# Evidence staleness: a stronger merged occurrence must refresh the picture
+# ---------------------------------------------------------------------------
+
+
+def test_a_stronger_merged_occurrence_replaces_the_alerts_evidence_photo() -> None:
+    """An alert's evidence must always reflect its strongest merged occurrence, not whichever
+    occurrence happened to create it first."""
+    from app.decision import RequirementDecision
+    from app.detection import BoundingBox, DetectedObject
+    from app.models import EvidenceSnapshot
+    from app.processing import refresh_evidence_for_stronger_occurrence
+
+    with SessionLocal() as session:
+        alert_id, job_id = _create_alert_with_job(session, evidence_available=True, job_storage_key=f"stronger-occurrence-{uuid4()}.jpg")
+        alert = session.get(ComplianceAlert, alert_id)
+        job = session.get(MediaJob, job_id)
+        original_snapshot = session.scalar(select(EvidenceSnapshot).where(EvidenceSnapshot.alert_id == alert_id))
+        original_storage_key = original_snapshot.storage_key
+        original_snapshot_id = original_snapshot.id
+
+        media_path = str(Path(settings.private_media_directory) / job.storage_key)
+        objects = (DetectedObject("no_helmet", 0.98, BoundingBox(0, 0, 10, 10)),)
+        refreshed = refresh_evidence_for_stronger_occurrence(session, alert, media_path, objects, "helmet required", 48)
+        session.commit()
+
+        assert refreshed is True
+        snapshots = session.scalars(select(EvidenceSnapshot).where(EvidenceSnapshot.alert_id == alert_id)).all()
+        assert len(snapshots) == 1, "refreshing must replace the one evidence row, never add a second"
+        assert snapshots[0].id == original_snapshot_id, "the same row is updated in place, not replaced with a new one"
+        assert snapshots[0].storage_key != original_storage_key
+        assert alert.evidence_available is True
