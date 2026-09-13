@@ -126,10 +126,13 @@ def _upgrade_frame_observation_expiry(connection: Connection) -> None:
     `datetime(created_at, '+24 hours')` instead.
     """
     _add_missing_columns(connection, "frame_observations", {"expires_at": "TIMESTAMP"})
-    if connection.dialect.name == "sqlite":
-        backfill_expression = "datetime(created_at, '+24 hours')"
-    else:
+    # SQLite's `datetime(column, '+N hours')` function has no PostgreSQL equivalent; use the
+    # dialect-appropriate interval expression so this migration succeeds against either engine
+    # (e.g. a local SQLite POC database or a shared PostgreSQL/Supabase deployment).
+    if connection.dialect.name == "postgresql":
         backfill_expression = "created_at + interval '24 hours'"
+    else:
+        backfill_expression = "datetime(created_at, '+24 hours')"
     connection.execute(
         text(
             "UPDATE frame_observations "

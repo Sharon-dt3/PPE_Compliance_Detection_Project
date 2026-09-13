@@ -305,7 +305,7 @@ function ComplianceChart({ report }: { report: Report | null }) {
     const chart = echarts.init(chartElement.current);
     chart.setOption({
       aria: { enabled: true, description: "Aggregate PPE observation breakdown." },
-      color: ["#087f5b", "#c92a2a", "#d97706"],
+      color: ["#16a34a", "#e11d48", "#f59e0b"],
       tooltip: { trigger: "item", valueFormatter: (value: number | string) => `${value} observations` },
       series: [{
         type: "pie",
@@ -340,7 +340,7 @@ function TrendChart({ points }: { points: TrendPoint[] }) {
     const chart = echarts.init(chartElement.current);
     chart.setOption({
       aria: { enabled: true, description: "Aggregate daily safety compliance trend." },
-      color: ["#087f5b", "#d97706"],
+      color: ["#16a34a", "#f59e0b"],
       tooltip: { trigger: "axis" },
       grid: { left: 46, right: 22, top: 25, bottom: 38 },
       legend: { data: ["Compliance rate", "Unknown observations"] },

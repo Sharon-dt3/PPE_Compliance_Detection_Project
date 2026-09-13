@@ -22,6 +22,7 @@ from app.auth import AuthenticatedActor, Role, current_actor, require_role
 from app.config import settings
 from app.database import get_session, initialise_database
 from app.evidence import check_face_detector_readiness
+from app.infra_health import check_database_readiness, check_redis_readiness
 from app.logging_config import configure_logging, set_correlation_id
 from app.media_validation import validate_media_upload, validate_video_file
 from app.models import (
@@ -580,6 +581,51 @@ def face_detector_health() -> dict[str, str]:
         and a human-readable ``detail`` message; never raises for an unready model.
     """
     readiness = check_face_detector_readiness()
+    return {"status": readiness.status, "detail": readiness.detail}
+
+
+@app.get(
+    "/health/database",
+    tags=["Health"],
+    summary="Check the configured database connection readiness",
+)
+# PUBLIC_INTERFACE
+def database_health() -> dict[str, str]:
+    """Report whether the configured database (SQLite or shared PostgreSQL) is reachable.
+
+    Verifies the Phase 3 "shared PostgreSQL deployment" requirement by opening a real
+    connection through the same engine the application uses and executing a trivial
+    round-trip query. This surfaces a misconfigured `PPE_DATABASE_URL`, missing driver, or
+    unreachable host at a single monitored endpoint instead of only on the first real
+    request.
+
+    Returns:
+        A JSON object with `status` (`ready` or `unavailable`) and a human-readable
+        `detail` message; never raises for an unreachable database.
+    """
+    readiness = check_database_readiness()
+    return {"status": readiness.status, "detail": readiness.detail}
+
+
+@app.get(
+    "/health/redis",
+    tags=["Health"],
+    summary="Check the configured Redis (Celery broker) connection readiness",
+)
+# PUBLIC_INTERFACE
+def redis_health() -> dict[str, str]:
+    """Report whether the configured Redis instance (Celery broker/backend) is reachable.
+
+    Verifies the Phase 3 "shared Redis deployment" requirement by sending a real PING to
+    the configured `PPE_REDIS_URL`. This surfaces an unprovisioned or unreachable Redis
+    instance at a single monitored endpoint instead of only when a media upload silently
+    fails to dispatch for background processing.
+
+    Returns:
+        A JSON object with `status` (`ready` or `unavailable`) and a human-readable
+        `detail` message; never raises for an unreachable Redis instance.
+    """
+    readiness = check_redis_readiness()
     return {"status": readiness.status, "detail": readiness.detail}
 
 
