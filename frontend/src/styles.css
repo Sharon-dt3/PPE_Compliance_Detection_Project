@@ -2,10 +2,10 @@
   /* Brand surface & ink */
   --ink: #101828;
   --ink-soft: #475569;
-  --surface: #f4f6fb;
-  --surface-alt: #eef1f8;
+  --surface: #eef7f1;
+  --surface-alt: #e3f2e8;
   --card: #ffffff;
-  --border: #dde3ee;
+  --border: #d7e7dd;
 
   /* Brand identity: deep industrial navy + safety-yellow accent */
   --navy-950: #0b1220;
@@ -43,8 +43,9 @@ body {
   margin: 0;
   min-width: 320px;
   background:
-    radial-gradient(1100px 480px at 100% -10%, #eef3ff 0%, transparent 55%),
-    radial-gradient(900px 420px at -10% 0%, #fff9e6 0%, transparent 50%),
+    radial-gradient(1100px 480px at 100% -10%, #dcf5e6 0%, transparent 55%),
+    radial-gradient(900px 420px at -10% 0%, #eafbef 0%, transparent 50%),
+    radial-gradient(1000px 600px at 50% 120%, #d3f0e0 0%, transparent 60%),
     var(--surface);
 }
 
