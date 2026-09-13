@@ -2,10 +2,10 @@
   /* Brand surface & ink */
   --ink: #101828;
   --ink-soft: #475569;
-  --surface: #eef7f1;
-  --surface-alt: #e3f2e8;
+  --surface: #cfe9dc;
+  --surface-alt: #bfe0d1;
   --card: #ffffff;
-  --border: #d7e7dd;
+  --border: #a7d2ba;
 
   /* Brand identity: deep industrial navy + safety-yellow accent */
   --navy-950: #0b1220;
@@ -42,11 +42,46 @@
 body {
   margin: 0;
   min-width: 320px;
+  overflow-x: hidden;
+  position: relative;
   background:
-    radial-gradient(1100px 480px at 100% -10%, #dcf5e6 0%, transparent 55%),
-    radial-gradient(900px 420px at -10% 0%, #eafbef 0%, transparent 50%),
-    radial-gradient(1000px 600px at 50% 120%, #d3f0e0 0%, transparent 60%),
+    radial-gradient(1100px 480px at 100% -10%, #a8dcbf 0%, transparent 55%),
+    radial-gradient(900px 420px at -10% 0%, #b7e6cd 0%, transparent 50%),
+    radial-gradient(1000px 600px at 50% 120%, #95d4b1 0%, transparent 60%),
     var(--surface);
+}
+
+/* Fixed graph-paper tech grid overlay, evoking a detection/HUD system */
+body::before {
+  background-image:
+    linear-gradient(rgba(10, 122, 83, .12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(10, 122, 83, .12) 1px, transparent 1px);
+  background-size: 44px 44px;
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: fixed;
+  z-index: 0;
+}
+
+/* Slow-drifting glow blobs for an animated, "alive" tech backdrop */
+body::after {
+  animation: drift-glow 20s ease-in-out infinite alternate;
+  background:
+    radial-gradient(560px 560px at 22% 28%, rgba(14, 159, 110, .32), transparent 62%),
+    radial-gradient(620px 620px at 78% 72%, rgba(245, 197, 24, .18), transparent 62%);
+  content: "";
+  filter: blur(46px);
+  inset: -18%;
+  pointer-events: none;
+  position: fixed;
+  z-index: 0;
+}
+
+@keyframes drift-glow {
+  0% { transform: translate(-2%, -1%) scale(1); }
+  50% { transform: translate(2%, 3%) scale(1.1); }
+  100% { transform: translate(-3%, 1%) scale(1); }
 }
 
 button,
@@ -162,7 +197,29 @@ textarea:focus-visible {
 
 /* ---------- App shell ---------- */
 
-.app-shell { display: grid; grid-template-columns: 264px minmax(0, 1fr); min-height: 100vh; }
+.app-shell { display: grid; grid-template-columns: 264px minmax(0, 1fr); min-height: 100vh; position: relative; z-index: 1; }
+
+/* Glowing scan-line sweep, reinforcing the detection/camera-monitoring vibe */
+.app-shell::after {
+  animation: scan-sweep 6.5s linear infinite;
+  background: linear-gradient(90deg, transparent, rgba(22, 163, 74, .6), transparent);
+  box-shadow: 0 0 14px 2px rgba(22, 163, 74, .35);
+  content: "";
+  height: 2px;
+  left: 0;
+  pointer-events: none;
+  position: fixed;
+  right: 0;
+  top: 0;
+  z-index: 2;
+}
+
+@keyframes scan-sweep {
+  0% { opacity: 0; top: 0; }
+  6% { opacity: 1; }
+  94% { opacity: 1; }
+  100% { opacity: 0; top: 100%; }
+}
 
 .sidebar {
   background: linear-gradient(185deg, var(--navy-900) 0%, var(--navy-950) 100%);
@@ -620,6 +677,32 @@ tbody tr:hover { background: #f8fafc; }
   line-height: 1.5;
   margin-top: 2rem;
   padding: 1.2rem 0 0;
+}
+
+/* ---------- Motion: entrance animations ---------- */
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.metric-card,
+.panel,
+.model-card,
+.alert,
+.job {
+  animation: fade-in-up .45s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
 }
 
 /* ---------- Login ---------- */
